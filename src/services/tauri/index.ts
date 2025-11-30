@@ -328,3 +328,29 @@ export async function deleteEndpointGpo(
 ): Promise<void> {
   return tauriCommand("delete_endpoint_gpo_cmd", { gpoType, tier });
 }
+
+// AD Diagnostics types
+export interface TierOuStatus {
+  tier: string;
+  ou_path: string;
+  exists: boolean;
+  object_count: number;
+  error: string | null;
+}
+
+export interface AdDiagnostics {
+  domain_dn: string;
+  com_init_status: string;
+  ldap_bind_status: string;
+  ldap_search_status: string;
+  objects_found: number;
+  error_code: string | null;
+  error_message: string | null;
+  steps_completed: string[];
+  tier_ou_status: TierOuStatus[];
+}
+
+// Diagnose AD connection - returns detailed diagnostic info for debugging
+export async function diagnoseAdConnection(): Promise<AdDiagnostics> {
+  return tauriCommand("diagnose_ad_connection");
+}

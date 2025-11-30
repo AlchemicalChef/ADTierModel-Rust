@@ -10,7 +10,7 @@ use crate::domain::{
 use crate::infrastructure::{
     AdConnection, add_group_member, check_initialization_status, create_admin_user,
     discover_tier0_infrastructure, get_tier_objects, initialize_tier_model, move_ad_object,
-    remove_group_member,
+    remove_group_member, test_ad_connection, AdDiagnostics,
 };
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
@@ -52,6 +52,67 @@ pub async fn get_domain_info() -> Result<DomainInfo, String> {
     }
 }
 
+/// Diagnose AD connection - returns detailed diagnostic info for debugging
+#[tauri::command]
+pub async fn diagnose_ad_connection() -> Result<AdDiagnostics, String> {
+    // First try to get the domain DN from existing connection
+    let domain_dn = {
+        let conn = AD_CONNECTION.lock().map_err(|e| format!("Lock error: {}", e))?;
+        match conn.as_ref() {
+            Some(c) => c.domain_dn.clone(),
+            None => {
+                // Try to establish connection first to get domain DN
+                drop(conn);
+                match AdConnection::connect() {
+                    Ok(c) => {
+                        let dn = c.domain_dn.clone();
+                        let mut conn = AD_CONNECTION.lock().map_err(|e| format!("Lock error: {}", e))?;
+                        *conn = Some(c);
+                        dn
+                    }
+                    Err(e) => {
+                        // Can't connect, try to discover domain DN another way
+                        // Return diagnostics showing the connection failure
+                        return Ok(AdDiagnostics {
+                            domain_dn: "Unknown - connection failed".to_string(),
+                            com_init_status: "Not tested".to_string(),
+                            ldap_bind_status: "Not tested".to_string(),
+                            ldap_search_status: "Not tested".to_string(),
+                            objects_found: 0,
+                            error_code: None,
+                            error_message: Some(format!("Initial connection failed: {}", e)),
+                            steps_completed: vec![format!("AdConnection::connect() failed: {}", e)],
+                            tier_ou_status: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+    };
+
+    // Run the diagnostic test in a separate thread to prevent hanging the async runtime
+    let dn = domain_dn.clone();
+    let handle = std::thread::spawn(move || {
+        test_ad_connection(&dn)
+    });
+
+    // Wait for the thread with a timeout
+    match handle.join() {
+        Ok(result) => Ok(result),
+        Err(_) => Ok(AdDiagnostics {
+            domain_dn,
+            com_init_status: "Unknown".to_string(),
+            ldap_bind_status: "Unknown".to_string(),
+            ldap_search_status: "Unknown".to_string(),
+            objects_found: 0,
+            error_code: Some("THREAD_PANIC".to_string()),
+            error_message: Some("Diagnostic thread panicked".to_string()),
+            steps_completed: vec!["Thread panicked during diagnostics".to_string()],
+            tier_ou_status: Vec::new(),
+        }),
+    }
+}
+
 /// Get tier counts for all tiers
 #[tauri::command]
 pub async fn get_tier_counts() -> Result<TierCounts, String> {
@@ -62,25 +123,55 @@ pub async fn get_tier_counts() -> Result<TierCounts, String> {
     };
     drop(conn); // Release lock before queries
 
-    let tier0 = get_tier_objects(&domain_dn, Some(Tier::Tier0))
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let tier1 = get_tier_objects(&domain_dn, Some(Tier::Tier1))
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let tier2 = get_tier_objects(&domain_dn, Some(Tier::Tier2))
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let unassigned = get_tier_objects(&domain_dn, None)
-        .map(|v| v.len())
-        .unwrap_or(0);
+    // Run all blocking LDAP queries in a separate thread to prevent blocking async runtime
+    let handle = std::thread::spawn(move || {
+        let tier0 = match get_tier_objects(&domain_dn, Some(Tier::Tier0)) {
+            Ok(v) => v.len(),
+            Err(e) => {
+                tracing::warn!(error = %e, "Tier0 query failed (OU may not exist)");
+                0
+            }
+        };
+        let tier1 = match get_tier_objects(&domain_dn, Some(Tier::Tier1)) {
+            Ok(v) => v.len(),
+            Err(e) => {
+                tracing::warn!(error = %e, "Tier1 query failed (OU may not exist)");
+                0
+            }
+        };
+        let tier2 = match get_tier_objects(&domain_dn, Some(Tier::Tier2)) {
+            Ok(v) => v.len(),
+            Err(e) => {
+                tracing::warn!(error = %e, "Tier2 query failed (OU may not exist)");
+                0
+            }
+        };
+        let unassigned = match get_tier_objects(&domain_dn, None) {
+            Ok(v) => v.len(),
+            Err(e) => {
+                tracing::error!(error = %e, "Unassigned query failed - this searches entire domain");
+                0
+            }
+        };
 
-    Ok(TierCounts {
-        tier0,
-        tier1,
-        tier2,
-        unassigned,
-    })
+        tracing::info!(
+            tier0 = tier0,
+            tier1 = tier1,
+            tier2 = tier2,
+            unassigned = unassigned,
+            "Tier counts retrieved"
+        );
+
+        TierCounts {
+            tier0,
+            tier1,
+            tier2,
+            unassigned,
+        }
+    });
+
+    handle.join()
+        .map_err(|_| "Tier counts query thread panicked".to_string())
 }
 
 /// Get members of a specific tier
@@ -101,7 +192,14 @@ pub async fn get_tier_members(tier_name: String) -> Result<Vec<TierMember>, Stri
     };
     drop(conn); // Release lock before query
 
-    get_tier_objects(&domain_dn, tier).map_err(|e| format!("Query failed: {}", e))
+    // Run blocking LDAP query in separate thread to prevent blocking async runtime
+    let handle = std::thread::spawn(move || {
+        get_tier_objects(&domain_dn, tier)
+    });
+
+    handle.join()
+        .map_err(|_| "Query thread panicked".to_string())?
+        .map_err(|e| format!("Query failed: {}", e))
 }
 
 /// Get Tier 0 infrastructure components
@@ -114,7 +212,14 @@ pub async fn get_tier0_infrastructure() -> Result<Vec<Tier0Component>, String> {
     };
     drop(conn); // Release lock before query
 
-    discover_tier0_infrastructure(&domain_dn).map_err(|e| format!("Discovery failed: {}", e))
+    // Run blocking LDAP query in separate thread to prevent blocking async runtime
+    let handle = std::thread::spawn(move || {
+        discover_tier0_infrastructure(&domain_dn)
+    });
+
+    handle.join()
+        .map_err(|_| "Discovery thread panicked".to_string())?
+        .map_err(|e| format!("Discovery failed: {}", e))
 }
 
 /// Force reconnection to AD

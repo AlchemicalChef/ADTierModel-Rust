@@ -77,3 +77,6 @@ debug/
 *.rpm
 *.AppImage
 *.snap
+
+# Claude Code
+.claude/

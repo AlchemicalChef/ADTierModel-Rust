@@ -18,7 +18,7 @@ import { useSettingsStore, type ThemeMode, type RefreshInterval } from "../../st
 import { useTierStore } from "../../store/tierStore";
 import { GpoManagementPanel } from "../gpo";
 import { HealthCheckPanel } from "../health";
-import { initializeAdTierModel, checkTierInitialization } from "../../services/tauri";
+import { initializeAdTierModel, checkTierInitialization, diagnoseAdConnection, type AdDiagnostics } from "../../services/tauri";
 import type { InitializationResult, InitializationStatus } from "../../types/tier";
 
 const themeOptions: { value: ThemeMode; label: string; icon: React.ElementType }[] = [
@@ -42,6 +42,9 @@ export function SettingsPanel() {
   const [initResult, setInitResult] = useState<InitializationResult | null>(null);
   const [isInitializing, setIsInitializing] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
+  const [isDiagnosing, setIsDiagnosing] = useState(false);
+  const [diagnosticResult, setDiagnosticResult] = useState<AdDiagnostics | null>(null);
+  const [diagnosticError, setDiagnosticError] = useState<string | null>(null);
 
   const {
     theme,
@@ -64,6 +67,21 @@ export function SettingsPanel() {
       console.error("Failed to check initialization status:", error);
     } finally {
       setIsCheckingStatus(false);
+    }
+  };
+
+  const handleDiagnose = async () => {
+    setIsDiagnosing(true);
+    setDiagnosticResult(null);
+    setDiagnosticError(null);
+    try {
+      const result = await diagnoseAdConnection();
+      setDiagnosticResult(result);
+    } catch (error) {
+      console.error("Diagnostic failed:", error);
+      setDiagnosticError(String(error));
+    } finally {
+      setIsDiagnosing(false);
     }
   };
 
@@ -192,6 +210,139 @@ export function SettingsPanel() {
               {domainInfo?.connected ? "Connected" : "Mock Mode"}
             </span>
           </div>
+        </div>
+
+        {/* AD Connection Diagnostics */}
+        <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h4 className="text-xs font-medium text-gray-600 dark:text-gray-400">AD Connection Diagnostics</h4>
+              <p className="text-xs text-gray-400 dark:text-gray-500">Test LDAP connectivity and identify issues</p>
+            </div>
+            <button
+              onClick={handleDiagnose}
+              disabled={isDiagnosing}
+              className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-colors disabled:opacity-50"
+            >
+              {isDiagnosing ? (
+                <ArrowPathIcon className="w-3 h-3 animate-spin" />
+              ) : (
+                <SignalIcon className="w-3 h-3" />
+              )}
+              Run Diagnostics
+            </button>
+          </div>
+
+          {/* Diagnostic Error */}
+          {diagnosticError && (
+            <div className="p-3 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-800">
+              <div className="flex items-center gap-2 text-red-700 dark:text-red-300 text-xs font-medium">
+                <XCircleIcon className="w-4 h-4" />
+                Diagnostic Failed
+              </div>
+              <p className="mt-1 text-xs text-red-600 dark:text-red-400 font-mono">{diagnosticError}</p>
+            </div>
+          )}
+
+          {/* Diagnostic Results */}
+          {diagnosticResult && (
+            <div className="p-3 bg-gray-50 dark:bg-surface-800 rounded-lg space-y-3">
+              <div className="flex items-center gap-2">
+                {diagnosticResult.error_code ? (
+                  <XCircleIcon className="w-5 h-5 text-red-500" />
+                ) : (
+                  <CheckCircleIcon className="w-5 h-5 text-green-500" />
+                )}
+                <span className={`text-sm font-medium ${diagnosticResult.error_code ? "text-red-700 dark:text-red-300" : "text-green-700 dark:text-green-300"}`}>
+                  {diagnosticResult.error_code ? "Connection Issues Detected" : "Connection Successful"}
+                </span>
+              </div>
+
+              {/* Steps Completed */}
+              <div>
+                <p className="text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Steps Completed:</p>
+                <ul className="text-xs text-gray-500 dark:text-gray-400 space-y-0.5">
+                  {diagnosticResult.steps_completed.map((step, i) => (
+                    <li key={i} className="flex items-center gap-1">
+                      <CheckCircleIcon className="w-3 h-3 text-green-500" />
+                      {step}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              {/* Status Details */}
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div>
+                  <p className="text-gray-400 dark:text-gray-500">COM Init</p>
+                  <p className={`font-mono ${diagnosticResult.com_init_status.includes("OK") ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400"}`}>
+                    {diagnosticResult.com_init_status}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-gray-400 dark:text-gray-500">LDAP Bind</p>
+                  <p className={`font-mono ${diagnosticResult.ldap_bind_status.includes("OK") ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400"}`}>
+                    {diagnosticResult.ldap_bind_status}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-gray-400 dark:text-gray-500">LDAP Search</p>
+                  <p className={`font-mono ${diagnosticResult.ldap_search_status.includes("OK") ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400"}`}>
+                    {diagnosticResult.ldap_search_status}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-gray-400 dark:text-gray-500">Objects Found</p>
+                  <p className="font-mono text-gray-600 dark:text-gray-300">{diagnosticResult.objects_found}</p>
+                </div>
+              </div>
+
+              {/* Error Details */}
+              {diagnosticResult.error_code && (
+                <div className="p-2 bg-red-50 dark:bg-red-900/20 rounded border border-red-200 dark:border-red-800">
+                  <p className="text-xs font-medium text-red-700 dark:text-red-300">Error Code: {diagnosticResult.error_code}</p>
+                  {diagnosticResult.error_message && (
+                    <p className="text-xs text-red-600 dark:text-red-400 mt-1">{diagnosticResult.error_message}</p>
+                  )}
+                </div>
+              )}
+
+              {/* Domain DN */}
+              <div>
+                <p className="text-xs text-gray-400 dark:text-gray-500">Domain DN Used</p>
+                <p className="text-xs font-mono text-gray-600 dark:text-gray-400">{diagnosticResult.domain_dn}</p>
+              </div>
+
+              {/* Tier OU Status */}
+              {diagnosticResult.tier_ou_status && diagnosticResult.tier_ou_status.length > 0 && (
+                <div className="mt-3 pt-3 border-t border-gray-200 dark:border-gray-700">
+                  <p className="text-xs font-medium text-gray-600 dark:text-gray-400 mb-2">Tier OU Status:</p>
+                  <div className="space-y-2">
+                    {diagnosticResult.tier_ou_status.map((status, i) => (
+                      <div key={i} className={`p-2 rounded text-xs ${
+                        status.error
+                          ? "bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800"
+                          : "bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800"
+                      }`}>
+                        <div className="flex items-center justify-between">
+                          <span className="font-medium">{status.tier}</span>
+                          <span className={status.error ? "text-red-600 dark:text-red-400" : "text-green-600 dark:text-green-400"}>
+                            {status.error ? (status.exists ? "Error" : "OU Not Found") : `${status.object_count} objects`}
+                          </span>
+                        </div>
+                        <p className="font-mono text-gray-500 dark:text-gray-400 mt-0.5 truncate" title={status.ou_path}>
+                          {status.ou_path}
+                        </p>
+                        {status.error && (
+                          <p className="text-red-600 dark:text-red-400 mt-1">{status.error}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </section>
 

@@ -14,6 +14,8 @@ use commands::{
     // Endpoint protection
     get_endpoint_protection_status, configure_endpoint_gpo, configure_all_endpoint_gpos,
     delete_endpoint_gpo_cmd,
+    // Diagnostics
+    diagnose_ad_connection,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -64,6 +66,8 @@ pub fn run() {
             configure_endpoint_gpo,
             configure_all_endpoint_gpos,
             delete_endpoint_gpo_cmd,
+            // Diagnostics
+            diagnose_ad_connection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
