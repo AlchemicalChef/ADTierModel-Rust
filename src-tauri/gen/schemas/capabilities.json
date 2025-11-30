@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capability set for AD Tier Model","local":true,"windows":["main"],"permissions":["core:default","shell:allow-open","dialog:allow-save","dialog:allow-message","dialog:allow-ask","fs:allow-write-text-file",{"identifier":"fs:allow-write","allow":[{"path":"$DOWNLOAD/**"},{"path":"$DOCUMENT/**"},{"path":"$DESKTOP/**"}]}]}}
