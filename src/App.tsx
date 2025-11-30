@@ -112,14 +112,15 @@ function App() {
   };
 
   return (
-    <div className="flex flex-col h-screen bg-gray-50 dark:bg-surface-900">
+    <div className="flex flex-col h-screen bg-gray-50 dark:bg-surface-900 overflow-hidden">
       <Header />
-      <main className="flex-1 overflow-hidden p-4">
+      <main className="flex-1 flex flex-col min-h-0 p-4">
         <Tab.Group
           selectedIndex={selectedIndex >= 0 ? selectedIndex : 0}
           onChange={handleTabChange}
+          className="flex flex-col flex-1 min-h-0"
         >
-          <Tab.List className="flex space-x-1 rounded-xl bg-white dark:bg-surface-800 p-1 shadow-sm mb-4">
+          <Tab.List className="flex space-x-1 rounded-xl bg-white dark:bg-surface-800 p-1 shadow-sm mb-4 flex-shrink-0">
             {tabs.map((tab) => {
               if (tab.type === "dashboard") {
                 // Dashboard tab
@@ -223,9 +224,9 @@ function App() {
             })}
           </Tab.List>
 
-          <Tab.Panels className="h-[calc(100%-60px)] overflow-auto">
+          <Tab.Panels className="flex-1 overflow-y-auto min-h-0">
             {tabs.map((tab) => (
-              <Tab.Panel key={tab.id} className="h-full">
+              <Tab.Panel key={tab.id} className="pb-6">
                 {tab.type === "dashboard" ? (
                   <DashboardOverview
                     onNavigateToTier={(tier) => {

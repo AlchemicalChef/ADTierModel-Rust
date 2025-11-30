@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 #[cfg(windows)]
 use windows::{
-    core::{BSTR, PCWSTR},
+    core::{BSTR, Interface, PCWSTR},
     Win32::Networking::ActiveDirectory::*,
     Win32::System::Com::*,
 };
@@ -48,6 +48,12 @@ pub fn ldap_search(
     attributes: &[&str],
     scope: SearchScope,
 ) -> AppResult<Vec<SearchResult>> {
+    tracing::debug!(
+        base_dn = base_dn,
+        filter = filter,
+        scope = ?scope,
+        "Executing LDAP search"
+    );
     unsafe {
         // Initialize COM if needed
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -60,13 +66,17 @@ pub fn ldap_search(
             PCWSTR(path_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IDirectorySearch::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IDirectorySearch as Interface>::IID,
             &mut search as *mut _ as *mut *mut std::ffi::c_void,
         )
-        .map_err(|e| AppError::LdapError(format!("Failed to open {}: {}", base_dn, e)))?;
+        .map_err(|e| {
+            tracing::error!(base_dn = base_dn, error = %e, "Failed to open LDAP path");
+            AppError::LdapError(format!("Failed to open {}: {}", base_dn, e))
+        })?;
 
         let search = search.ok_or_else(|| {
+            tracing::error!(base_dn = base_dn, "Search interface not available");
             AppError::LdapError(format!("Search interface not available for {}", base_dn))
         })?;
 
@@ -75,9 +85,9 @@ pub fn ldap_search(
             ADS_SEARCHPREF_INFO {
                 dwSearchPref: ADS_SEARCHPREF_SEARCH_SCOPE,
                 vValue: ADSVALUE {
-                    dwType: ADSTYPE_INTEGER.0 as u32,
+                    dwType: ADSTYPE_INTEGER,
                     Anonymous: ADSVALUE_0 {
-                        Integer: scope.to_ads_scope() as i32,
+                        Integer: scope.to_ads_scope() as u32,
                     },
                 },
                 dwStatus: ADS_STATUS_S_OK,
@@ -85,7 +95,7 @@ pub fn ldap_search(
             ADS_SEARCHPREF_INFO {
                 dwSearchPref: ADS_SEARCHPREF_PAGESIZE,
                 vValue: ADSVALUE {
-                    dwType: ADSTYPE_INTEGER.0 as u32,
+                    dwType: ADSTYPE_INTEGER,
                     Anonymous: ADSVALUE_0 { Integer: 1000 },
                 },
                 dwStatus: ADS_STATUS_S_OK,
@@ -100,15 +110,16 @@ pub fn ldap_search(
 
         // Execute search
         let filter_bstr = BSTR::from(filter);
-        let mut search_handle: ADS_SEARCH_HANDLE = std::ptr::null_mut();
 
-        search.ExecuteSearch(
+        let search_handle = search.ExecuteSearch(
             PCWSTR(filter_bstr.as_ptr()),
-            Some(attr_ptrs.as_ptr() as *mut PCWSTR),
+            attr_ptrs.as_ptr(),
             attributes.len() as u32,
-            &mut search_handle,
         )
-        .map_err(|e| AppError::LdapError(format!("Search execution failed: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!(filter = filter, error = %e, "Search execution failed");
+            AppError::LdapError(format!("Search execution failed: {}", e))
+        })?;
 
         let mut results = Vec::new();
 
@@ -133,18 +144,13 @@ pub fn ldap_search(
         }
 
         search.CloseSearchHandle(search_handle).ok();
+        tracing::debug!(
+            base_dn = base_dn,
+            result_count = results.len(),
+            "LDAP search completed"
+        );
         Ok(results)
     }
-}
-
-#[cfg(not(windows))]
-pub fn ldap_search(
-    _base_dn: &str,
-    _filter: &str,
-    _attributes: &[&str],
-    _scope: SearchScope,
-) -> AppResult<Vec<SearchResult>> {
-    Err(AppError::NotConnected)
 }
 
 /// LDAP search scope
@@ -189,10 +195,10 @@ unsafe fn extract_column_values(column: &ADS_SEARCH_COLUMN) -> Vec<String> {
 /// Extract a string from an ADSVALUE
 #[cfg(windows)]
 unsafe fn extract_adsvalue(value: &ADSVALUE) -> Option<String> {
-    match ADSTYPE(value.dwType as i32) {
+    match value.dwType {
         ADSTYPE_DN_STRING | ADSTYPE_CASE_EXACT_STRING | ADSTYPE_CASE_IGNORE_STRING
         | ADSTYPE_PRINTABLE_STRING | ADSTYPE_NUMERIC_STRING => {
-            let ptr = value.Anonymous.CaseIgnoreString.0;
+            let ptr = value.Anonymous.CaseIgnoreString;
             if ptr.is_null() {
                 return None;
             }
@@ -207,8 +213,8 @@ unsafe fn extract_adsvalue(value: &ADSVALUE) -> Option<String> {
             Some(value.Anonymous.Integer.to_string())
         }
         ADSTYPE_LARGE_INTEGER => {
-            let li = &value.Anonymous.LargeInteger;
-            let val = ((li.HighPart as i64) << 32) | (li.LowPart as i64);
+            // LargeInteger is now i64 directly in windows 0.59
+            let val = value.Anonymous.LargeInteger;
             Some(val.to_string())
         }
         ADSTYPE_UTC_TIME => {
@@ -405,6 +411,7 @@ pub fn search_result_to_tier0_component(result: &SearchResult, domain_dn: &str) 
 
 /// Get all objects in a tier OU
 pub fn get_tier_objects(domain_dn: &str, tier: Option<Tier>) -> AppResult<Vec<TierMember>> {
+    tracing::debug!(tier = ?tier, domain_dn = domain_dn, "Getting tier objects");
     let base_dn = match tier {
         Some(t) => format!("{},{}", t.ou_path(), domain_dn),
         None => domain_dn.to_string(), // Search whole domain for unassigned
@@ -444,6 +451,7 @@ pub fn get_tier_objects(domain_dn: &str, tier: Option<Tier>) -> AppResult<Vec<Ti
         });
     }
 
+    tracing::debug!(tier = ?tier, member_count = members.len(), "Retrieved tier objects");
     Ok(members)
 }
 
@@ -535,10 +543,13 @@ fn extract_server_from_ntds_settings(ntds_dn: &str) -> Option<String> {
 
 /// Discover Tier 0 infrastructure components
 pub fn discover_tier0_infrastructure(domain_dn: &str) -> AppResult<Vec<Tier0Component>> {
+    tracing::info!(domain_dn = domain_dn, "Discovering Tier 0 infrastructure components");
     let mut components = Vec::new();
 
     // 0. FSMO Role Holders
+    tracing::debug!("Discovering FSMO role holders");
     let fsmo_components = discover_fsmo_roles(domain_dn);
+    tracing::debug!(count = fsmo_components.len(), "Found FSMO role holders");
     components.extend(fsmo_components);
 
     // 1. Domain Controllers (in Domain Controllers OU)
@@ -655,5 +666,19 @@ pub fn discover_tier0_infrastructure(domain_dn: &str) -> AppResult<Vec<Tier0Comp
         }
     }
 
+    tracing::info!(
+        total_components = components.len(),
+        "Tier 0 infrastructure discovery complete"
+    );
     Ok(components)
+}
+
+/// Get group memberships for an AD object
+#[cfg(windows)]
+pub fn get_object_group_memberships(
+    object_dn: &str,
+) -> crate::error::AppResult<Vec<crate::commands::tier_management::GroupMembership>> {
+    // TODO: Implement actual group membership lookup
+    let _ = object_dn;
+    Ok(vec![])
 }

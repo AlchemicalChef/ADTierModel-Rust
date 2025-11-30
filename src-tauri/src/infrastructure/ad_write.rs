@@ -12,10 +12,9 @@ use crate::error::AppError;
 
 #[cfg(windows)]
 use windows::{
-    core::{BSTR, Interface, PCWSTR, VARIANT},
+    core::{BSTR, Interface, PCWSTR},
     Win32::Networking::ActiveDirectory::*,
     Win32::System::Com::*,
-    Win32::System::Ole::IDispatch,
     Win32::System::Variant::*,
 };
 
@@ -33,8 +32,8 @@ pub fn ou_exists(ou_dn: &str) -> AppResult<bool> {
             PCWSTR(path_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADs::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADs as Interface>::IID,
             &mut obj as *mut _ as *mut *mut std::ffi::c_void,
         );
 
@@ -42,25 +41,15 @@ pub fn ou_exists(ou_dn: &str) -> AppResult<bool> {
     }
 }
 
-#[cfg(not(windows))]
-pub fn ou_exists(_ou_dn: &str) -> AppResult<bool> {
-    Ok(false)
-}
-
 /// Check if a group exists
-#[cfg(windows)]
 pub fn group_exists(group_dn: &str) -> AppResult<bool> {
     ou_exists(group_dn) // Same check works for groups
-}
-
-#[cfg(not(windows))]
-pub fn group_exists(_group_dn: &str) -> AppResult<bool> {
-    Ok(false)
 }
 
 /// Create an Organizational Unit
 #[cfg(windows)]
 pub fn create_ou(parent_dn: &str, ou_name: &str, description: Option<&str>) -> AppResult<String> {
+    tracing::info!(ou_name = ou_name, parent_dn = parent_dn, "Creating organizational unit");
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
@@ -72,8 +61,8 @@ pub fn create_ou(parent_dn: &str, ou_name: &str, description: Option<&str>) -> A
             PCWSTR(path_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADsContainer::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADsContainer as Interface>::IID,
             &mut container as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| AppError::LdapError(format!("Failed to open container {}: {}", parent_dn, e)))?;
@@ -86,16 +75,18 @@ pub fn create_ou(parent_dn: &str, ou_name: &str, description: Option<&str>) -> A
         let class_name = BSTR::from("organizationalUnit");
         let relative_name = BSTR::from(format!("OU={}", ou_name).as_str());
 
-        let new_obj = container
-            .Create(PCWSTR(class_name.as_ptr()), PCWSTR(relative_name.as_ptr()))
-            .map_err(|e| AppError::LdapError(format!("Failed to create OU {}: {}", ou_name, e)))?;
+        let new_obj: IADs = container
+            .Create(&class_name, &relative_name)
+            .map_err(|e| AppError::LdapError(format!("Failed to create OU {}: {}", ou_name, e)))?
+            .cast()
+            .map_err(|e| AppError::LdapError(format!("Failed to cast to IADs: {}", e)))?;
 
         // Set description if provided
         if let Some(desc) = description {
             let desc_name = BSTR::from("description");
             let desc_value = create_bstr_variant(desc);
             new_obj
-                .Put(PCWSTR(desc_name.as_ptr()), desc_value)
+                .Put(&desc_name, &desc_value)
                 .map_err(|e| AppError::LdapError(format!("Failed to set description: {}", e)))?;
         }
 
@@ -106,17 +97,15 @@ pub fn create_ou(parent_dn: &str, ou_name: &str, description: Option<&str>) -> A
         // Commit the changes
         new_obj
             .SetInfo()
-            .map_err(|e| AppError::LdapError(format!("Failed to commit OU {}: {}", ou_name, e)))?;
+            .map_err(|e| {
+                tracing::error!(ou_name = ou_name, error = %e, "Failed to commit OU");
+                AppError::LdapError(format!("Failed to commit OU {}: {}", ou_name, e))
+            })?;
 
         let new_dn = format!("OU={},{}", ou_name, parent_dn);
+        tracing::info!(ou_dn = new_dn.as_str(), "Successfully created organizational unit");
         Ok(new_dn)
     }
-}
-
-#[cfg(not(windows))]
-pub fn create_ou(_parent_dn: &str, ou_name: &str, _description: Option<&str>) -> AppResult<String> {
-    // Mock implementation for non-Windows
-    Ok(format!("OU={},DC=mock,DC=domain", ou_name))
 }
 
 /// Create a security group
@@ -127,6 +116,12 @@ pub fn create_security_group(
     description: Option<&str>,
     group_scope: GroupScope,
 ) -> AppResult<String> {
+    tracing::info!(
+        group_name = group_name,
+        parent_dn = parent_dn,
+        scope = ?group_scope,
+        "Creating security group"
+    );
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
@@ -138,8 +133,8 @@ pub fn create_security_group(
             PCWSTR(path_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADsContainer::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADsContainer as Interface>::IID,
             &mut container as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| AppError::LdapError(format!("Failed to open container {}: {}", parent_dn, e)))?;
@@ -152,15 +147,17 @@ pub fn create_security_group(
         let class_name = BSTR::from("group");
         let relative_name = BSTR::from(format!("CN={}", group_name).as_str());
 
-        let new_obj = container
-            .Create(PCWSTR(class_name.as_ptr()), PCWSTR(relative_name.as_ptr()))
-            .map_err(|e| AppError::LdapError(format!("Failed to create group {}: {}", group_name, e)))?;
+        let new_obj: IADs = container
+            .Create(&class_name, &relative_name)
+            .map_err(|e| AppError::LdapError(format!("Failed to create group {}: {}", group_name, e)))?
+            .cast()
+            .map_err(|e| AppError::LdapError(format!("Failed to cast to IADs: {}", e)))?;
 
         // Set sAMAccountName
         let sam_name = BSTR::from("sAMAccountName");
         let sam_value = create_bstr_variant(group_name);
         new_obj
-            .Put(PCWSTR(sam_name.as_ptr()), sam_value)
+            .Put(&sam_name, &sam_value)
             .map_err(|e| AppError::LdapError(format!("Failed to set sAMAccountName: {}", e)))?;
 
         // Set groupType (Security group + scope)
@@ -176,7 +173,7 @@ pub fn create_security_group(
         let group_type_name = BSTR::from("groupType");
         let group_type_variant = create_i4_variant(group_type_value);
         new_obj
-            .Put(PCWSTR(group_type_name.as_ptr()), group_type_variant)
+            .Put(&group_type_name, &group_type_variant)
             .map_err(|e| AppError::LdapError(format!("Failed to set groupType: {}", e)))?;
 
         // Set description if provided
@@ -184,29 +181,22 @@ pub fn create_security_group(
             let desc_name = BSTR::from("description");
             let desc_value = create_bstr_variant(desc);
             new_obj
-                .Put(PCWSTR(desc_name.as_ptr()), desc_value)
+                .Put(&desc_name, &desc_value)
                 .map_err(|e| AppError::LdapError(format!("Failed to set description: {}", e)))?;
         }
 
         // Commit the changes
         new_obj
             .SetInfo()
-            .map_err(|e| AppError::LdapError(format!("Failed to commit group {}: {}", group_name, e)))?;
+            .map_err(|e| {
+                tracing::error!(group_name = group_name, error = %e, "Failed to commit group");
+                AppError::LdapError(format!("Failed to commit group {}: {}", group_name, e))
+            })?;
 
         let new_dn = format!("CN={},{}", group_name, parent_dn);
+        tracing::info!(group_dn = new_dn.as_str(), "Successfully created security group");
         Ok(new_dn)
     }
-}
-
-#[cfg(not(windows))]
-pub fn create_security_group(
-    _parent_dn: &str,
-    group_name: &str,
-    _description: Option<&str>,
-    _group_scope: GroupScope,
-) -> AppResult<String> {
-    // Mock implementation for non-Windows
-    Ok(format!("CN={},OU=Groups,DC=mock,DC=domain", group_name))
 }
 
 /// Group scope for security groups
@@ -220,6 +210,11 @@ pub enum GroupScope {
 /// Move an AD object to a different OU
 #[cfg(windows)]
 pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> {
+    tracing::info!(
+        object_dn = object_dn,
+        target_ou = target_ou_dn,
+        "Moving AD object"
+    );
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
@@ -232,8 +227,8 @@ pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> 
             PCWSTR(object_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADs::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADs as Interface>::IID,
             &mut obj as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| AppError::LdapError(format!("Failed to open object {}: {}", object_dn, e)))?;
@@ -251,8 +246,8 @@ pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> 
             PCWSTR(target_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADsContainer::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADsContainer as Interface>::IID,
             &mut target_container as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| {
@@ -270,10 +265,17 @@ pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> 
         let ads_path = obj.ADsPath().map_err(|e| {
             AppError::LdapError(format!("Failed to get ADsPath: {}", e))
         })?;
+        let empty_bstr = BSTR::new();
 
         target_container
-            .MoveHere(PCWSTR(ads_path.as_ptr()), PCWSTR::null())
+            .MoveHere(&ads_path, &empty_bstr)
             .map_err(|e| {
+                tracing::error!(
+                    object_dn = object_dn,
+                    target_ou = target_ou_dn,
+                    error = %e,
+                    "Failed to move AD object"
+                );
                 AppError::LdapError(format!(
                     "Failed to move {} to {}: {}",
                     object_dn, target_ou_dn, e
@@ -287,20 +289,19 @@ pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> 
             .unwrap_or(object_dn);
         let new_dn = format!("{},{}", rdn, target_ou_dn);
 
+        tracing::info!(new_dn = new_dn.as_str(), "Successfully moved AD object");
         Ok(new_dn)
     }
-}
-
-#[cfg(not(windows))]
-pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> {
-    // Mock implementation for non-Windows
-    let rdn = object_dn.split(',').next().unwrap_or(object_dn);
-    Ok(format!("{},{}", rdn, target_ou_dn))
 }
 
 /// Add a member to a group
 #[cfg(windows)]
 pub fn add_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
+    tracing::info!(
+        group_dn = group_dn,
+        member_dn = member_dn,
+        "Adding member to group"
+    );
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
@@ -312,8 +313,8 @@ pub fn add_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
             PCWSTR(group_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADsGroup::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADsGroup as Interface>::IID,
             &mut group as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| AppError::LdapError(format!("Failed to open group {}: {}", group_dn, e)))?;
@@ -327,17 +328,20 @@ pub fn add_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
         let member_bstr = BSTR::from(member_path.as_str());
 
         group
-            .Add(PCWSTR(member_bstr.as_ptr()))
-            .map_err(|e| AppError::LdapError(format!("Failed to add {} to {}: {}", member_dn, group_dn, e)))?;
+            .Add(&member_bstr)
+            .map_err(|e| {
+                tracing::error!(
+                    group_dn = group_dn,
+                    member_dn = member_dn,
+                    error = %e,
+                    "Failed to add member to group"
+                );
+                AppError::LdapError(format!("Failed to add {} to {}: {}", member_dn, group_dn, e))
+            })?;
 
+        tracing::debug!(group_dn = group_dn, member_dn = member_dn, "Successfully added member to group");
         Ok(())
     }
-}
-
-#[cfg(not(windows))]
-pub fn add_group_member(_group_dn: &str, _member_dn: &str) -> AppResult<()> {
-    // Mock implementation for non-Windows
-    Ok(())
 }
 
 /// Create a tiered admin user account
@@ -361,8 +365,8 @@ pub fn create_admin_user(
             PCWSTR(path_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADsContainer::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADsContainer as Interface>::IID,
             &mut container as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| AppError::LdapError(format!("Failed to open container {}: {}", parent_dn, e)))?;
@@ -375,15 +379,17 @@ pub fn create_admin_user(
         let class_name = BSTR::from("user");
         let relative_name = BSTR::from(format!("CN={}", display_name).as_str());
 
-        let new_obj = container
-            .Create(PCWSTR(class_name.as_ptr()), PCWSTR(relative_name.as_ptr()))
-            .map_err(|e| AppError::LdapError(format!("Failed to create user {}: {}", sam_account_name, e)))?;
+        let new_obj: IADs = container
+            .Create(&class_name, &relative_name)
+            .map_err(|e| AppError::LdapError(format!("Failed to create user {}: {}", sam_account_name, e)))?
+            .cast()
+            .map_err(|e| AppError::LdapError(format!("Failed to cast to IADs: {}", e)))?;
 
         // Set sAMAccountName
         let sam_attr = BSTR::from("sAMAccountName");
         let sam_value = create_bstr_variant(sam_account_name);
         new_obj
-            .Put(PCWSTR(sam_attr.as_ptr()), sam_value)
+            .Put(&sam_attr, &sam_value)
             .map_err(|e| AppError::LdapError(format!("Failed to set sAMAccountName: {}", e)))?;
 
         // Set userPrincipalName (UPN)
@@ -398,14 +404,14 @@ pub fn create_admin_user(
         let upn_attr = BSTR::from("userPrincipalName");
         let upn_value = create_bstr_variant(&upn);
         new_obj
-            .Put(PCWSTR(upn_attr.as_ptr()), upn_value)
+            .Put(&upn_attr, &upn_value)
             .map_err(|e| AppError::LdapError(format!("Failed to set UPN: {}", e)))?;
 
         // Set displayName
         let display_attr = BSTR::from("displayName");
         let display_value = create_bstr_variant(display_name);
         new_obj
-            .Put(PCWSTR(display_attr.as_ptr()), display_value)
+            .Put(&display_attr, &display_value)
             .map_err(|e| AppError::LdapError(format!("Failed to set displayName: {}", e)))?;
 
         // Set description if provided
@@ -413,7 +419,7 @@ pub fn create_admin_user(
             let desc_attr = BSTR::from("description");
             let desc_value = create_bstr_variant(desc);
             new_obj
-                .Put(PCWSTR(desc_attr.as_ptr()), desc_value)
+                .Put(&desc_attr, &desc_value)
                 .map_err(|e| AppError::LdapError(format!("Failed to set description: {}", e)))?;
         }
 
@@ -429,7 +435,7 @@ pub fn create_admin_user(
 
         // Set password
         let password_bstr = BSTR::from(password);
-        user.SetPassword(PCWSTR(password_bstr.as_ptr()))
+        user.SetPassword(&password_bstr)
             .map_err(|e| AppError::LdapError(format!("Failed to set password: {}", e)))?;
 
         // Set userAccountControl to enable/disable account
@@ -439,7 +445,7 @@ pub fn create_admin_user(
         let uac_variant = create_i4_variant(uac_value);
         user.cast::<IADs>()
             .map_err(|e| AppError::LdapError(format!("Failed to cast to IADs: {}", e)))?
-            .Put(PCWSTR(uac_attr.as_ptr()), uac_variant)
+            .Put(&uac_attr, &uac_variant)
             .map_err(|e| AppError::LdapError(format!("Failed to set account control: {}", e)))?;
 
         // Commit changes
@@ -453,22 +459,14 @@ pub fn create_admin_user(
     }
 }
 
-#[cfg(not(windows))]
-pub fn create_admin_user(
-    parent_dn: &str,
-    _sam_account_name: &str,
-    display_name: &str,
-    _description: Option<&str>,
-    _password: &str,
-    _enabled: bool,
-) -> AppResult<String> {
-    // Mock implementation for non-Windows
-    Ok(format!("CN={},{}", display_name, parent_dn))
-}
-
 /// Remove a member from a group
 #[cfg(windows)]
 pub fn remove_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
+    tracing::info!(
+        group_dn = group_dn,
+        member_dn = member_dn,
+        "Removing member from group"
+    );
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
@@ -480,8 +478,8 @@ pub fn remove_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
             PCWSTR(group_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADsGroup::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADsGroup as Interface>::IID,
             &mut group as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| AppError::LdapError(format!("Failed to open group {}: {}", group_dn, e)))?;
@@ -495,35 +493,45 @@ pub fn remove_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
         let member_bstr = BSTR::from(member_path.as_str());
 
         group
-            .Remove(PCWSTR(member_bstr.as_ptr()))
-            .map_err(|e| AppError::LdapError(format!("Failed to remove {} from {}: {}", member_dn, group_dn, e)))?;
+            .Remove(&member_bstr)
+            .map_err(|e| {
+                tracing::error!(
+                    group_dn = group_dn,
+                    member_dn = member_dn,
+                    error = %e,
+                    "Failed to remove member from group"
+                );
+                AppError::LdapError(format!("Failed to remove {} from {}: {}", member_dn, group_dn, e))
+            })?;
 
+        tracing::debug!(group_dn = group_dn, member_dn = member_dn, "Successfully removed member from group");
         Ok(())
     }
-}
-
-#[cfg(not(windows))]
-pub fn remove_group_member(_group_dn: &str, _member_dn: &str) -> AppResult<()> {
-    // Mock implementation for non-Windows
-    Ok(())
 }
 
 /// Create a VARIANT containing a BSTR
 #[cfg(windows)]
 unsafe fn create_bstr_variant(s: &str) -> VARIANT {
+    use windows::Win32::System::Variant::VariantInit;
     let bstr = BSTR::from(s);
-    let mut var: VARIANT = std::mem::zeroed();
-    var.Anonymous.Anonymous.vt = VT_BSTR;
-    var.Anonymous.Anonymous.Anonymous.bstrVal = std::mem::ManuallyDrop::new(bstr);
+    let mut var: VARIANT = VariantInit();
+    // Access the union fields carefully
+    let inner = &mut *std::ptr::addr_of_mut!(var.Anonymous.Anonymous);
+    inner.vt = VT_BSTR;
+    let innermost = &mut *std::ptr::addr_of_mut!(inner.Anonymous);
+    innermost.bstrVal = std::mem::ManuallyDrop::new(bstr);
     var
 }
 
 /// Create a VARIANT containing an i4 (32-bit integer)
 #[cfg(windows)]
 unsafe fn create_i4_variant(val: i32) -> VARIANT {
-    let mut var: VARIANT = std::mem::zeroed();
-    var.Anonymous.Anonymous.vt = VT_I4;
-    var.Anonymous.Anonymous.Anonymous.lVal = val;
+    use windows::Win32::System::Variant::VariantInit;
+    let mut var: VARIANT = VariantInit();
+    let inner = &mut *std::ptr::addr_of_mut!(var.Anonymous.Anonymous);
+    inner.vt = VT_I4;
+    let innermost = &mut *std::ptr::addr_of_mut!(inner.Anonymous);
+    innermost.lVal = val;
     var
 }
 
@@ -628,8 +636,8 @@ pub fn set_ou_permissions(
             PCWSTR(path_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADs::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADs as Interface>::IID,
             &mut obj as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| AppError::LdapError(format!("Failed to open OU {}: {}", ou_dn, e)))?;
@@ -640,13 +648,15 @@ pub fn set_ou_permissions(
 
         // Get the security descriptor
         let sd_prop = BSTR::from("ntSecurityDescriptor");
-        let sd_variant = obj.Get(PCWSTR(sd_prop.as_ptr())).map_err(|e| {
+        let sd_variant = obj.Get(&sd_prop).map_err(|e| {
             AppError::LdapError(format!("Failed to get security descriptor: {}", e))
         })?;
 
         // Get the IADsSecurityDescriptor interface
-        let sd_dispatch = sd_variant.Anonymous.Anonymous.Anonymous.pdispVal;
-        let sd: IADsSecurityDescriptor = (*sd_dispatch).cast().map_err(|e| {
+        let sd_dispatch = sd_variant.Anonymous.Anonymous.Anonymous.pdispVal
+            .as_ref()
+            .ok_or_else(|| AppError::LdapError("Security descriptor dispatch is null".into()))?;
+        let sd: IADsSecurityDescriptor = sd_dispatch.cast().map_err(|e| {
             AppError::LdapError(format!("Failed to cast to security descriptor: {}", e))
         })?;
 
@@ -678,7 +688,7 @@ pub fn set_ou_permissions(
         })?;
 
         let trustee_bstr = BSTR::from(trustee);
-        ace.SetTrustee(PCWSTR(trustee_bstr.as_ptr())).map_err(|e| {
+        ace.SetTrustee(&trustee_bstr).map_err(|e| {
             AppError::LdapError(format!("Failed to set trustee: {}", e))
         })?;
 
@@ -703,12 +713,17 @@ pub fn set_ou_permissions(
             AppError::LdapError(format!("Failed to cast SD to IDispatch: {}", e))
         })?;
 
-        let mut sd_variant_out: VARIANT = std::mem::zeroed();
-        sd_variant_out.Anonymous.Anonymous.vt = VT_DISPATCH;
-        sd_variant_out.Anonymous.Anonymous.Anonymous.pdispVal =
-            std::mem::ManuallyDrop::new(Some(sd_dispatch_out));
+        let mut sd_variant_out: VARIANT = {
+            use windows::Win32::System::Variant::VariantInit;
+            let mut var = VariantInit();
+            let inner = &mut *std::ptr::addr_of_mut!(var.Anonymous.Anonymous);
+            inner.vt = VT_DISPATCH;
+            let innermost = &mut *std::ptr::addr_of_mut!(inner.Anonymous);
+            innermost.pdispVal = std::mem::ManuallyDrop::new(Some(sd_dispatch_out));
+            var
+        };
 
-        obj.Put(PCWSTR(sd_prop.as_ptr()), sd_variant_out).map_err(|e| {
+        obj.Put(&sd_prop, &sd_variant_out).map_err(|e| {
             AppError::LdapError(format!("Failed to put security descriptor: {}", e))
         })?;
 
@@ -718,18 +733,6 @@ pub fn set_ou_permissions(
 
         Ok(())
     }
-}
-
-#[cfg(not(windows))]
-pub fn set_ou_permissions(
-    _ou_dn: &str,
-    _trustee: &str,
-    _rights: AdRights,
-    _ace_type: AceType,
-    _flags: AceFlags,
-) -> AppResult<()> {
-    // Mock implementation for non-Windows
-    Ok(())
 }
 
 /// Protect an OU from accidental deletion
@@ -743,12 +746,6 @@ pub fn protect_ou_from_deletion(ou_dn: &str) -> AppResult<()> {
         AceType::Deny,
         AceFlags::None,
     )
-}
-
-#[cfg(not(windows))]
-pub fn protect_ou_from_deletion(_ou_dn: &str) -> AppResult<()> {
-    // Mock implementation for non-Windows
-    Ok(())
 }
 
 // ============================================================================
@@ -876,19 +873,6 @@ pub fn create_tier_gpos(domain_dn: &str) -> AppResult<Vec<String>> {
     Ok(gpos_created)
 }
 
-#[cfg(not(windows))]
-pub fn create_tier_gpos(_domain_dn: &str) -> AppResult<Vec<String>> {
-    // Mock implementation for non-Windows development
-    Ok(vec![
-        "SEC-Tier0-BasePolicy".to_string(),
-        "SEC-Tier0-LogonRestrictions".to_string(),
-        "SEC-Tier1-BasePolicy".to_string(),
-        "SEC-Tier1-LogonRestrictions".to_string(),
-        "SEC-Tier2-BasePolicy".to_string(),
-        "SEC-Tier2-LogonRestrictions".to_string(),
-    ])
-}
-
 /// Configure logon restrictions in an existing GPO
 /// This is an advanced operation that requires the GPO to exist
 #[cfg(windows)]
@@ -946,16 +930,6 @@ pub fn configure_logon_restrictions(
         ));
     }
 
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn configure_logon_restrictions(
-    _gpo_name: &str,
-    _deny_groups: &[String],
-    _domain_dn: &str,
-) -> AppResult<()> {
-    // Mock implementation
     Ok(())
 }
 
@@ -1060,6 +1034,14 @@ pub fn initialize_tier_model(
     domain_dn: &str,
     options: &InitializationOptions,
 ) -> AppResult<InitializationResult> {
+    tracing::info!(
+        domain_dn = domain_dn,
+        create_ou = options.create_ou_structure,
+        create_groups = options.create_groups,
+        set_permissions = options.set_permissions,
+        create_gpos = options.create_gpos,
+        "Initializing AD Tier Model"
+    );
     let mut result = InitializationResult::new();
 
     // Create OU structure
@@ -1193,12 +1175,21 @@ pub fn initialize_tier_model(
         }
     }
 
+    tracing::info!(
+        ous_created = result.ous_created.len(),
+        groups_created = result.groups_created.len(),
+        gpos_created = result.gpos_created.len(),
+        warnings = result.warnings.len(),
+        errors = result.errors.len(),
+        "AD Tier Model initialization complete"
+    );
     Ok(result)
 }
 
 /// Disable a user account by setting userAccountControl flag
 #[cfg(windows)]
 pub fn disable_account(object_dn: &str) -> AppResult<()> {
+    tracing::info!(object_dn = object_dn, "Disabling account");
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
@@ -1210,8 +1201,8 @@ pub fn disable_account(object_dn: &str) -> AppResult<()> {
             PCWSTR(path_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADs::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADs as Interface>::IID,
             &mut obj as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| AppError::LdapError(format!("Failed to open object {}: {}", object_dn, e)))?;
@@ -1223,7 +1214,7 @@ pub fn disable_account(object_dn: &str) -> AppResult<()> {
         // Get current userAccountControl
         let uac_attr = BSTR::from("userAccountControl");
         let uac_variant = obj
-            .Get(PCWSTR(uac_attr.as_ptr()))
+            .Get(&uac_attr)
             .map_err(|e| AppError::LdapError(format!("Failed to get userAccountControl: {}", e)))?;
 
         let current_uac = uac_variant.Anonymous.Anonymous.Anonymous.lVal;
@@ -1234,21 +1225,19 @@ pub fn disable_account(object_dn: &str) -> AppResult<()> {
 
         // Set the new value
         let new_uac_variant = create_i4_variant(new_uac);
-        obj.Put(PCWSTR(uac_attr.as_ptr()), new_uac_variant)
+        obj.Put(&uac_attr, &new_uac_variant)
             .map_err(|e| AppError::LdapError(format!("Failed to set userAccountControl: {}", e)))?;
 
         // Commit the change
         obj.SetInfo()
-            .map_err(|e| AppError::LdapError(format!("Failed to commit disable: {}", e)))?;
+            .map_err(|e| {
+                tracing::error!(object_dn = object_dn, error = %e, "Failed to commit disable");
+                AppError::LdapError(format!("Failed to commit disable: {}", e))
+            })?;
 
+        tracing::info!(object_dn = object_dn, "Successfully disabled account");
         Ok(())
     }
-}
-
-#[cfg(not(windows))]
-pub fn disable_account(_object_dn: &str) -> AppResult<()> {
-    // Mock implementation for non-Windows
-    Ok(())
 }
 
 /// Bulk disable multiple accounts
@@ -1267,6 +1256,7 @@ pub fn bulk_disable_accounts(object_dns: &[String]) -> Vec<Result<String, String
 /// This sets the TRUSTED_TO_AUTH_FOR_DELEGATION flag off and sets NOT_DELEGATED flag
 #[cfg(windows)]
 pub fn harden_service_account(object_dn: &str) -> AppResult<()> {
+    tracing::info!(object_dn = object_dn, "Hardening service account");
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
@@ -1278,8 +1268,8 @@ pub fn harden_service_account(object_dn: &str) -> AppResult<()> {
             PCWSTR(path_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IADs::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IADs as Interface>::IID,
             &mut obj as *mut _ as *mut *mut std::ffi::c_void,
         )
         .map_err(|e| AppError::LdapError(format!("Failed to open object {}: {}", object_dn, e)))?;
@@ -1291,7 +1281,7 @@ pub fn harden_service_account(object_dn: &str) -> AppResult<()> {
         // Get current userAccountControl
         let uac_attr = BSTR::from("userAccountControl");
         let uac_variant = obj
-            .Get(PCWSTR(uac_attr.as_ptr()))
+            .Get(&uac_attr)
             .map_err(|e| AppError::LdapError(format!("Failed to get userAccountControl: {}", e)))?;
 
         let current_uac = uac_variant.Anonymous.Anonymous.Anonymous.lVal;
@@ -1305,21 +1295,19 @@ pub fn harden_service_account(object_dn: &str) -> AppResult<()> {
 
         // Set the new value
         let new_uac_variant = create_i4_variant(new_uac);
-        obj.Put(PCWSTR(uac_attr.as_ptr()), new_uac_variant)
+        obj.Put(&uac_attr, &new_uac_variant)
             .map_err(|e| AppError::LdapError(format!("Failed to set userAccountControl: {}", e)))?;
 
         // Commit the change
         obj.SetInfo()
-            .map_err(|e| AppError::LdapError(format!("Failed to commit security hardening: {}", e)))?;
+            .map_err(|e| {
+                tracing::error!(object_dn = object_dn, error = %e, "Failed to commit security hardening");
+                AppError::LdapError(format!("Failed to commit security hardening: {}", e))
+            })?;
 
+        tracing::info!(object_dn = object_dn, "Successfully hardened service account");
         Ok(())
     }
-}
-
-#[cfg(not(windows))]
-pub fn harden_service_account(_object_dn: &str) -> AppResult<()> {
-    // Mock implementation for non-Windows
-    Ok(())
 }
 
 /// Bulk harden multiple service accounts

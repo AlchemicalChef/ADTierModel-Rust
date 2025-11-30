@@ -118,12 +118,27 @@ pub fn get_all_gpo_status(domain_dn: &str) -> AppResult<Vec<TierGpoStatus>> {
                 $result.logonLinked = $null -ne $logonLink
                 $result.logonLinkEnabled = if ($logonLink) {{ $logonLink.Enabled }} else {{ $false }}
 
-                # Check configured restrictions using GPO report
-                $report = Get-GPOReport -Name '{logon_name}' -ReportType Xml -ErrorAction SilentlyContinue
-                if ($report) {{
-                    $result.restrictionsConfigured = $report -match 'SeDenyInteractiveLogonRight|SeDenyRemoteInteractiveLogonRight|SeDenyNetworkLogonRight'
-                }} else {{
-                    $result.restrictionsConfigured = $false
+                # Check configured restrictions by directly reading GptTmpl.inf from SYSVOL
+                $result.restrictionsConfigured = $false
+                try {{
+                    Import-Module ActiveDirectory -ErrorAction Stop
+                    $domain = Get-ADDomain -ErrorAction Stop
+                    $gpoGuid = "{{"  + $logonGpo.Id.ToString().ToUpper() + "}}"
+                    $sysvolPath = "\\$($domain.PDCEmulator)\SYSVOL\$($domain.DNSRoot)\Policies\$gpoGuid"
+                    $gptTmplPath = Join-Path $sysvolPath "Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
+
+                    if (Test-Path $gptTmplPath) {{
+                        $content = Get-Content $gptTmplPath -Raw -ErrorAction SilentlyContinue
+                        if ($content -match 'SeDenyInteractiveLogonRight|SeDenyRemoteInteractiveLogonRight') {{
+                            $result.restrictionsConfigured = $true
+                        }}
+                    }}
+                }} catch {{
+                    # Fall back to GPO report method
+                    $report = Get-GPOReport -Name '{logon_name}' -ReportType Xml -ErrorAction SilentlyContinue
+                    if ($report -and ($report -match 'SeDenyInteractiveLogonRight|SeDenyRemoteInteractiveLogonRight')) {{
+                        $result.restrictionsConfigured = $true
+                    }}
                 }}
             }} else {{
                 $result.logonExists = $false
@@ -208,55 +223,11 @@ pub fn get_all_gpo_status(domain_dn: &str) -> AppResult<Vec<TierGpoStatus>> {
     Ok(statuses)
 }
 
-#[cfg(not(windows))]
-pub fn get_all_gpo_status(domain_dn: &str) -> AppResult<Vec<TierGpoStatus>> {
-    // Mock data for non-Windows development
-    let mut statuses = Vec::new();
-
-    for tier in Tier::all() {
-        let tier_name = tier.to_string();
-        let base_name = format!("SEC-{}-BasePolicy", tier_name);
-        let logon_name = format!("SEC-{}-LogonRestrictions", tier_name);
-        let target_ou = format!("OU={},{}", tier_name, domain_dn);
-
-        // Simulate Tier0 as configured, others as not
-        let is_configured = *tier == Tier::Tier0;
-
-        statuses.push(TierGpoStatus {
-            tier: tier_name.clone(),
-            base_policy: GpoStatus {
-                name: base_name,
-                exists: is_configured,
-                linked: is_configured,
-                link_enabled: is_configured,
-                target_ou: target_ou.clone(),
-                created: if is_configured { Some("2024-11-01T10:00:00Z".to_string()) } else { None },
-                modified: if is_configured { Some("2024-11-15T14:30:00Z".to_string()) } else { None },
-            },
-            logon_restrictions: GpoStatus {
-                name: logon_name,
-                exists: is_configured,
-                linked: is_configured,
-                link_enabled: is_configured,
-                target_ou: target_ou.clone(),
-                created: if is_configured { Some("2024-11-01T10:05:00Z".to_string()) } else { None },
-                modified: if is_configured { Some("2024-11-15T14:35:00Z".to_string()) } else { None },
-            },
-            restrictions_configured: is_configured,
-            deny_local_logon: get_deny_groups_for_tier(*tier, "local"),
-            deny_rdp_logon: get_deny_groups_for_tier(*tier, "rdp"),
-            deny_network_logon: get_deny_groups_for_tier(*tier, "network"),
-        });
-    }
-
-    Ok(statuses)
-}
-
 /// Get the groups that should be denied for a tier
 fn get_deny_groups_for_tier(tier: Tier, logon_type: &str) -> Vec<String> {
     match tier {
         Tier::Tier0 => {
-            // Tier 0: Deny Tier1 and Tier2 admins
+            // Tier 0: Deny Tier1 and Tier2 admins (lower tiers can't access Tier 0)
             vec![
                 "Tier1-Admins".to_string(),
                 "Tier1-Operators".to_string(),
@@ -265,24 +236,20 @@ fn get_deny_groups_for_tier(tier: Tier, logon_type: &str) -> Vec<String> {
             ]
         }
         Tier::Tier1 => {
-            // Tier 1: Deny Tier0 and Tier2 admins
-            // (Tier0 shouldn't log into Tier1, Tier2 definitely shouldn't)
+            // Tier 1: Deny Tier0 (higher tier) and Tier2 (lower tier)
             match logon_type {
-                "local" | "rdp" => vec![
+                "local" | "rdp" | "network" => vec![
                     "Tier0-Admins".to_string(),
                     "Tier2-Admins".to_string(),
                     "Tier2-Operators".to_string(),
                 ],
-                _ => vec![
-                    "Tier2-Admins".to_string(),
-                    "Tier2-Operators".to_string(),
-                ],
+                _ => vec![],
             }
         }
         Tier::Tier2 => {
-            // Tier 2: Deny Tier0 and Tier1 admins interactive logon
+            // Tier 2: Deny Tier0 and Tier1 (higher tiers can't access Tier 2)
             match logon_type {
-                "local" | "rdp" => vec![
+                "local" | "rdp" | "network" => vec![
                     "Tier0-Admins".to_string(),
                     "Tier1-Admins".to_string(),
                     "Tier1-Operators".to_string(),
@@ -309,16 +276,24 @@ pub fn configure_tier_gpos(tier: Tier, domain_dn: &str) -> AppResult<GpoConfigRe
     let deny_rdp = get_deny_groups_for_tier(tier, "rdp");
     let deny_network = get_deny_groups_for_tier(tier, "network");
 
-    // Build the deny lists for the INF file
-    let deny_local_str = deny_local.join(",");
-    let deny_rdp_str = deny_rdp.join(",");
-    let deny_network_str = deny_network.join(",");
+    // Build the deny lists as PowerShell array strings
+    let deny_local_ps: Vec<String> = deny_local.iter().map(|g| format!("'{}'", g)).collect();
+    let deny_rdp_ps: Vec<String> = deny_rdp.iter().map(|g| format!("'{}'", g)).collect();
+    let deny_network_ps: Vec<String> = deny_network.iter().map(|g| format!("'{}'", g)).collect();
 
-    // PowerShell script to create GPOs and configure restrictions
+    let deny_local_str = deny_local_ps.join(",");
+    let deny_rdp_str = deny_rdp_ps.join(",");
+    let deny_network_str = deny_network_ps.join(",");
+
+    // Apply network deny for all tiers to enforce tier isolation
+    let apply_network_deny = true;
+
+    // PowerShell script to create GPOs and configure restrictions using SecPol approach
     let ps_script = format!(
         r#"
-        $ErrorActionPreference = 'Stop'
-        Import-Module GroupPolicy
+        $ErrorActionPreference = 'Continue'
+        Import-Module GroupPolicy -ErrorAction Stop
+        Import-Module ActiveDirectory -ErrorAction Stop
 
         $results = @{{
             created = @()
@@ -326,14 +301,34 @@ pub fn configure_tier_gpos(tier: Tier, domain_dn: &str) -> AppResult<GpoConfigRe
             linked = @()
             errors = @()
             warnings = @()
+            debug = @()
+        }}
+
+        # Function to resolve group name to SID string for INF file
+        function Get-GroupSidString {{
+            param([string]$GroupName)
+            try {{
+                $group = Get-ADGroup -Filter "Name -eq '$GroupName'" -ErrorAction Stop
+                if ($group) {{
+                    return "*" + $group.SID.Value
+                }}
+                return $null
+            }} catch {{
+                $results.debug += "Failed to resolve group $GroupName : $_"
+                return $null
+            }}
         }}
 
         try {{
+            $domain = Get-ADDomain -ErrorAction Stop
+            $results.debug += "Domain: $($domain.DNSRoot)"
+
             # Create base policy GPO if needed
             $baseGpo = Get-GPO -Name '{base_name}' -ErrorAction SilentlyContinue
             if (-not $baseGpo) {{
                 $baseGpo = New-GPO -Name '{base_name}' -Comment 'Base security policy for {tier}'
                 $results.created += '{base_name}'
+                $results.debug += "Created GPO: {base_name}"
             }}
 
             # Create logon restrictions GPO if needed
@@ -341,97 +336,189 @@ pub fn configure_tier_gpos(tier: Tier, domain_dn: &str) -> AppResult<GpoConfigRe
             if (-not $logonGpo) {{
                 $logonGpo = New-GPO -Name '{logon_name}' -Comment 'Logon restrictions for {tier} - Enforces tier isolation'
                 $results.created += '{logon_name}'
+                $results.debug += "Created GPO: {logon_name}"
             }}
 
             # Link GPOs to target OU
-            $links = Get-GPInheritance -Target '{target_ou}' -ErrorAction SilentlyContinue
+            try {{
+                $links = Get-GPInheritance -Target '{target_ou}' -ErrorAction Stop
 
-            if (-not ($links.GpoLinks | Where-Object {{ $_.DisplayName -eq '{base_name}' }})) {{
-                New-GPLink -Name '{base_name}' -Target '{target_ou}' -LinkEnabled Yes -ErrorAction SilentlyContinue
-                $results.linked += '{base_name}'
+                $baseLinked = $links.GpoLinks | Where-Object {{ $_.DisplayName -eq '{base_name}' }}
+                if (-not $baseLinked) {{
+                    New-GPLink -Name '{base_name}' -Target '{target_ou}' -LinkEnabled Yes -ErrorAction Stop | Out-Null
+                    $results.linked += '{base_name}'
+                }}
+
+                $logonLinked = $links.GpoLinks | Where-Object {{ $_.DisplayName -eq '{logon_name}' }}
+                if (-not $logonLinked) {{
+                    New-GPLink -Name '{logon_name}' -Target '{target_ou}' -LinkEnabled Yes -ErrorAction Stop | Out-Null
+                    $results.linked += '{logon_name}'
+                }}
+            }} catch {{
+                $results.warnings += "Could not link GPO to OU: $_. The OU may not exist yet."
             }}
 
-            if (-not ($links.GpoLinks | Where-Object {{ $_.DisplayName -eq '{logon_name}' }})) {{
-                New-GPLink -Name '{logon_name}' -Target '{target_ou}' -LinkEnabled Yes -Order 1 -ErrorAction SilentlyContinue
-                $results.linked += '{logon_name}'
+            # Resolve groups to SIDs
+            $denyLocalGroups = @({deny_local})
+            $denyRdpGroups = @({deny_rdp})
+            $denyNetworkGroups = @({deny_network})
+
+            $results.warnings += "Looking for local deny groups: $($denyLocalGroups -join ', ')"
+
+            $denyLocalSids = @()
+            foreach ($grp in $denyLocalGroups) {{
+                $sid = Get-GroupSidString -GroupName $grp
+                if ($sid) {{
+                    $denyLocalSids += $sid
+                    $results.warnings += "Resolved $grp to $sid"
+                }} else {{
+                    $results.warnings += "Group NOT FOUND: $grp - Please ensure this group exists"
+                }}
             }}
 
-            # Configure logon restrictions using security template
-            # Create a temporary INF file with the security settings
+            $denyRdpSids = @()
+            foreach ($grp in $denyRdpGroups) {{
+                $sid = Get-GroupSidString -GroupName $grp
+                if ($sid) {{
+                    $denyRdpSids += $sid
+                }}
+            }}
+
+            $denyNetworkSids = @()
+            foreach ($grp in $denyNetworkGroups) {{
+                $sid = Get-GroupSidString -GroupName $grp
+                if ($sid) {{ $denyNetworkSids += $sid }}
+            }}
+
+            $results.warnings += "Resolved $($denyLocalSids.Count) local deny SIDs, $($denyRdpSids.Count) RDP deny SIDs"
+
+            if ($denyLocalSids.Count -eq 0 -and $denyRdpSids.Count -eq 0) {{
+                $results.errors += "No tier groups found. Please initialize the tier structure first to create the security groups (Tier0-Admins, Tier1-Admins, etc.)"
+                $results | ConvertTo-Json -Depth 3 -Compress
+                return
+            }}
+
+            # Build the GptTmpl.inf content - proper security template format
             $infContent = @"
 [Unicode]
 Unicode=yes
 [Version]
-signature="$CHICAGO$"
+signature="`$CHICAGO`$"
 Revision=1
 [Privilege Rights]
 "@
+            if ($denyLocalSids.Count -gt 0) {{
+                # Deny log on locally
+                $infContent += "`r`nSeDenyInteractiveLogonRight = $($denyLocalSids -join ',')"
+                $results.warnings += "SeDenyInteractiveLogonRight = $($denyLocalSids -join ',')"
 
-            # Add deny rights if we have groups to deny
-            $denyLocal = '{deny_local}'
-            $denyRdp = '{deny_rdp}'
-            $denyNetwork = '{deny_network}'
+                # Deny log on as a batch job
+                $infContent += "`r`nSeDenyBatchLogonRight = $($denyLocalSids -join ',')"
+                $results.warnings += "SeDenyBatchLogonRight = $($denyLocalSids -join ',')"
 
-            if ($denyLocal) {{
-                $infContent += "`nSeDenyInteractiveLogonRight = $denyLocal"
+                # Deny log on as a service
+                $infContent += "`r`nSeDenyServiceLogonRight = $($denyLocalSids -join ',')"
+                $results.warnings += "SeDenyServiceLogonRight = $($denyLocalSids -join ',')"
             }}
-            if ($denyRdp) {{
-                $infContent += "`nSeDenyRemoteInteractiveLogonRight = $denyRdp"
+            if ($denyRdpSids.Count -gt 0) {{
+                # Deny log on through Remote Desktop Services
+                $infContent += "`r`nSeDenyRemoteInteractiveLogonRight = $($denyRdpSids -join ',')"
+                $results.warnings += "SeDenyRemoteInteractiveLogonRight = $($denyRdpSids -join ',')"
             }}
-            if ($denyNetwork -and '{tier}' -eq 'Tier0') {{
-                # Only apply network deny for Tier0
-                $infContent += "`nSeDenyNetworkLogonRight = $denyNetwork"
+            if ({apply_network_deny} -and $denyNetworkSids.Count -gt 0) {{
+                # Deny access to this computer from the network
+                $infContent += "`r`nSeDenyNetworkLogonRight = $($denyNetworkSids -join ',')"
+            }}
+            $infContent += "`r`n"
+
+            # Get SYSVOL path
+            $gpoGuid = "{{"  + $logonGpo.Id.ToString().ToUpper() + "}}"
+            $sysvolPath = "\\$($domain.PDCEmulator)\SYSVOL\$($domain.DNSRoot)\Policies\$gpoGuid"
+            $results.debug += "SYSVOL path: $sysvolPath"
+
+            # Create the SecEdit folder structure
+            $machineFolder = Join-Path $sysvolPath "Machine"
+            $secEditFolder = Join-Path $machineFolder "Microsoft\Windows NT\SecEdit"
+
+            if (-not (Test-Path $secEditFolder)) {{
+                New-Item -Path $secEditFolder -ItemType Directory -Force | Out-Null
+                $results.debug += "Created SecEdit folder"
             }}
 
-            # Create temp file and import
-            $tempInf = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.inf'
-            $infContent | Out-File -FilePath $tempInf -Encoding Unicode
+            # Write the GptTmpl.inf file
+            $gptTmplPath = Join-Path $secEditFolder "GptTmpl.inf"
+            $infContent | Out-File -FilePath $gptTmplPath -Encoding Unicode -Force
+            $results.debug += "Wrote GptTmpl.inf to $gptTmplPath"
 
-            # Get GPO path
-            $gpoPath = $logonGpo.Path
-            $machineFolder = "\\$((Get-ADDomain).PDCEmulator)\SYSVOL\$((Get-ADDomain).DNSRoot)\Policies\{{{0}}}\Machine" -f $logonGpo.Id
-
-            # Create Machine\Microsoft\Windows NT\SecEdit folder if needed
-            $secEditPath = Join-Path $machineFolder 'Microsoft\Windows NT\SecEdit'
-            if (-not (Test-Path $secEditPath)) {{
-                New-Item -Path $secEditPath -ItemType Directory -Force | Out-Null
+            # Get current version from AD first
+            $adVersion = 0
+            $gpoFilter = "displayName -eq '{logon_name}'"
+            $gpoDN = Get-ADObject -Filter $gpoFilter -SearchBase "CN=Policies,CN=System,$($domain.DistinguishedName)" -Properties versionNumber -ErrorAction SilentlyContinue
+            if ($gpoDN) {{
+                $adVersion = [int]$gpoDN.versionNumber
             }}
 
-            # Copy INF to GptTmpl.inf
-            $gptTmplPath = Join-Path $secEditPath 'GptTmpl.inf'
-            Copy-Item -Path $tempInf -Destination $gptTmplPath -Force
+            # Update GPT.ini to increment version and add CSE GUIDs
+            $gptIniPath = Join-Path $sysvolPath "GPT.INI"
 
-            # Update gpt.ini to increment version
-            $gptIniPath = "\\$((Get-ADDomain).PDCEmulator)\SYSVOL\$((Get-ADDomain).DNSRoot)\Policies\{{{0}}}\gpt.ini" -f $logonGpo.Id
+            # CSE GUIDs for Security Settings
+            # {{827D319E-6EAC-11D2-A4EA-00C04F79F83A}} = Security CSE
+            # {{803E14A0-B4FB-11D0-A0D0-00A0C90F574B}} = Security Editor
+            $cseGuids = "[{{827D319E-6EAC-11D2-A4EA-00C04F79F83A}}{{803E14A0-B4FB-11D0-A0D0-00A0C90F574B}}]"
+
+            $gptVersion = 0
             if (Test-Path $gptIniPath) {{
-                $gptIni = Get-Content $gptIniPath
-                $version = 0
-                foreach ($line in $gptIni) {{
-                    if ($line -match 'Version=(\d+)') {{
-                        $version = [int]$matches[1]
-                    }}
+                $gptIni = Get-Content $gptIniPath -Raw
+                if ($gptIni -match 'Version=(\d+)') {{
+                    $gptVersion = [int]$matches[1]
                 }}
-                $newVersion = $version + 1
-                $gptIni = $gptIni -replace 'Version=\d+', "Version=$newVersion"
-
-                # Add machine extension GUIDs if not present
-                if ($gptIni -notmatch 'gPCMachineExtensionNames') {{
-                    $gptIni += "`ngPCMachineExtensionNames=[{{827D319E-6EAC-11D2-A4EA-00C04F79F83A}}{{803E14A0-B4FB-11D0-A0D0-00A0C90F574B}}]"
-                }}
-
-                $gptIni | Out-File -FilePath $gptIniPath -Encoding ASCII
             }}
 
-            # Cleanup temp file
-            Remove-Item -Path $tempInf -Force -ErrorAction SilentlyContinue
+            # Use the higher of AD or GPT.INI version, then increment
+            $newVersion = [Math]::Max($adVersion, $gptVersion) + 1
+            $results.warnings += "Version: AD=$adVersion, GPT.INI=$gptVersion, New=$newVersion"
+
+            # Write GPT.INI with proper format
+            $gptIniContent = @"
+[General]
+Version=$newVersion
+gPCMachineExtensionNames=$cseGuids
+"@
+            Set-Content -Path $gptIniPath -Value $gptIniContent -Encoding ASCII -Force -NoNewline
+            $results.debug += "Updated GPT.INI with version $newVersion"
+
+            # Update the AD object's versionNumber attribute to match
+            try {{
+                if ($gpoDN) {{
+                    Set-ADObject -Identity $gpoDN.DistinguishedName -Replace @{{versionNumber=$newVersion}}
+                    $results.warnings += "Updated AD GPO versionNumber to $newVersion"
+                }} else {{
+                    $results.warnings += "Could not find GPO in AD by displayName"
+                }}
+            }} catch {{
+                $results.warnings += "Could not update AD version: $($_.Exception.Message)"
+            }}
+
+            # Verify the file was written correctly
+            if (Test-Path $gptTmplPath) {{
+                $writtenContent = Get-Content $gptTmplPath -Raw -ErrorAction SilentlyContinue
+                if ($writtenContent -match 'SeDenyInteractiveLogonRight') {{
+                    $results.warnings += "VERIFIED: GptTmpl.inf contains SeDenyInteractiveLogonRight"
+                }} else {{
+                    $results.errors += "ERROR: GptTmpl.inf was written but does not contain expected content"
+                }}
+            }} else {{
+                $results.errors += "ERROR: GptTmpl.inf was not created at $gptTmplPath"
+            }}
 
             $results.configured += '{logon_name}'
 
         }} catch {{
-            $results.errors += $_.Exception.Message
+            $results.errors += "Exception: $($_.Exception.Message)"
+            $results.debug += "Full error: $_"
         }}
 
-        $results | ConvertTo-Json -Compress
+        $results | ConvertTo-Json -Depth 3 -Compress
         "#,
         base_name = base_name,
         logon_name = logon_name,
@@ -440,25 +527,46 @@ Revision=1
         deny_local = deny_local_str,
         deny_rdp = deny_rdp_str,
         deny_network = deny_network_str,
+        apply_network_deny = if apply_network_deny { "$true" } else { "$false" },
     );
+
+    tracing::info!(tier = tier_name.as_str(), "Configuring GPOs for tier");
 
     let output = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
         .output()
-        .map_err(|e| AppError::LdapError(format!("Failed to execute PowerShell: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to execute PowerShell");
+            AppError::LdapError(format!("Failed to execute PowerShell: {}", e))
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if !stderr.is_empty() && !output.status.success() {
-        result.add_error(format!("PowerShell error: {}", stderr));
+    tracing::debug!(stdout = %stdout, "PowerShell output");
+
+    if !stderr.is_empty() {
+        tracing::warn!(stderr = %stderr, "PowerShell stderr");
+        if !output.status.success() {
+            result.add_error(format!("PowerShell error: {}", stderr));
+        }
     }
 
     // Parse the JSON result
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        // Log debug info
+        if let Some(debug) = json["debug"].as_array() {
+            for item in debug {
+                if let Some(s) = item.as_str() {
+                    tracing::debug!(message = s, "GPO config debug");
+                }
+            }
+        }
+
         if let Some(created) = json["created"].as_array() {
             for item in created {
                 if let Some(s) = item.as_str() {
+                    tracing::info!(gpo = s, "Created GPO");
                     result.gpos_created.push(s.to_string());
                 }
             }
@@ -466,6 +574,7 @@ Revision=1
         if let Some(configured) = json["configured"].as_array() {
             for item in configured {
                 if let Some(s) = item.as_str() {
+                    tracing::info!(gpo = s, "Configured GPO");
                     result.gpos_configured.push(s.to_string());
                 }
             }
@@ -473,6 +582,7 @@ Revision=1
         if let Some(linked) = json["linked"].as_array() {
             for item in linked {
                 if let Some(s) = item.as_str() {
+                    tracing::info!(gpo = s, "Linked GPO");
                     result.gpos_linked.push(s.to_string());
                 }
             }
@@ -480,6 +590,7 @@ Revision=1
         if let Some(errors) = json["errors"].as_array() {
             for item in errors {
                 if let Some(s) = item.as_str() {
+                    tracing::error!(error = s, "GPO configuration error");
                     result.add_error(s.to_string());
                 }
             }
@@ -487,26 +598,23 @@ Revision=1
         if let Some(warnings) = json["warnings"].as_array() {
             for item in warnings {
                 if let Some(s) = item.as_str() {
+                    tracing::warn!(warning = s, "GPO configuration warning");
                     result.add_warning(s.to_string());
                 }
             }
         }
+    } else {
+        tracing::error!(stdout = %stdout, "Failed to parse PowerShell JSON output");
+        result.add_error(format!("Failed to parse result: {}", stdout));
     }
 
-    Ok(result)
-}
-
-#[cfg(not(windows))]
-pub fn configure_tier_gpos(tier: Tier, _domain_dn: &str) -> AppResult<GpoConfigResult> {
-    // Mock implementation for non-Windows
-    let tier_name = tier.to_string();
-    let mut result = GpoConfigResult::new();
-
-    result.gpos_created.push(format!("SEC-{}-BasePolicy", tier_name));
-    result.gpos_created.push(format!("SEC-{}-LogonRestrictions", tier_name));
-    result.gpos_configured.push(format!("SEC-{}-LogonRestrictions", tier_name));
-    result.gpos_linked.push(format!("SEC-{}-BasePolicy", tier_name));
-    result.gpos_linked.push(format!("SEC-{}-LogonRestrictions", tier_name));
+    tracing::info!(
+        tier = tier_name.as_str(),
+        success = result.success,
+        created = result.gpos_created.len(),
+        configured = result.gpos_configured.len(),
+        "GPO configuration complete"
+    );
 
     Ok(result)
 }
@@ -580,13 +688,4 @@ pub fn delete_tier_gpos(tier: Tier, _domain_dn: &str) -> AppResult<Vec<String>> 
     } else {
         Ok(Vec::new())
     }
-}
-
-#[cfg(not(windows))]
-pub fn delete_tier_gpos(tier: Tier, _domain_dn: &str) -> AppResult<Vec<String>> {
-    let tier_name = tier.to_string();
-    Ok(vec![
-        format!("SEC-{}-BasePolicy", tier_name),
-        format!("SEC-{}-LogonRestrictions", tier_name),
-    ])
 }

@@ -16,12 +16,7 @@ use crate::infrastructure::ad_search::{ldap_search, SearchScope};
 #[cfg(windows)]
 pub fn get_domain_dn() -> Result<String, String> {
     let conn = AdConnection::connect().map_err(|e| format!("Failed to connect to AD: {:?}", e))?;
-    Ok(conn.domain_dn)
-}
-
-#[cfg(not(windows))]
-pub fn get_domain_dn() -> Result<String, String> {
-    Ok("DC=contoso,DC=com".to_string())
+    Ok(conn.domain_dn.clone())
 }
 
 /// Check for cross-tier access violations
@@ -113,25 +108,6 @@ pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, 
     Ok(violations)
 }
 
-#[cfg(not(windows))]
-pub fn check_cross_tier_access(_domain_dn: &str) -> Result<Vec<CrossTierAccess>, String> {
-    // Return mock data for non-Windows development
-    Ok(vec![
-        CrossTierAccess {
-            account_name: "admin.crossover".to_string(),
-            account_dn: "CN=Admin Crossover,OU=Users,OU=Tier1,DC=contoso,DC=com".to_string(),
-            tiers: vec![Tier::Tier0, Tier::Tier1],
-            groups: vec!["Tier0-Admins".to_string(), "Tier1-Admins".to_string()],
-        },
-        CrossTierAccess {
-            account_name: "svc.badpractice".to_string(),
-            account_dn: "CN=Bad Practice SVC,OU=ServiceAccounts,OU=Tier2,DC=contoso,DC=com".to_string(),
-            tiers: vec![Tier::Tier1, Tier::Tier2],
-            groups: vec!["Tier1-ServiceAccounts".to_string(), "Tier2-Admins".to_string()],
-        },
-    ])
-}
-
 /// Check for stale accounts (not logged in for extended period)
 #[cfg(windows)]
 pub fn check_stale_accounts(domain_dn: &str, days_threshold: i64) -> Result<Vec<ComplianceViolation>, String> {
@@ -199,32 +175,6 @@ pub fn check_stale_accounts(domain_dn: &str, days_threshold: i64) -> Result<Vec<
     Ok(violations)
 }
 
-#[cfg(not(windows))]
-pub fn check_stale_accounts(_domain_dn: &str, _days_threshold: i64) -> Result<Vec<ComplianceViolation>, String> {
-    Ok(vec![
-        ComplianceViolation {
-            violation_type: ViolationType::StaleAccount,
-            severity: ViolationSeverity::Medium,
-            object_name: "old.admin".to_string(),
-            object_dn: "CN=Old Admin,OU=Users,OU=Tier1,DC=contoso,DC=com".to_string(),
-            sam_account_name: "old.admin".to_string(),
-            description: "Account has not logged in for 180 days".to_string(),
-            tiers_involved: vec![Tier::Tier1],
-            remediation: "Review account necessity and disable if no longer needed".to_string(),
-        },
-        ComplianceViolation {
-            violation_type: ViolationType::StaleAccount,
-            severity: ViolationSeverity::High,
-            object_name: "former.employee".to_string(),
-            object_dn: "CN=Former Employee,OU=Users,OU=Tier2,DC=contoso,DC=com".to_string(),
-            sam_account_name: "former.employee".to_string(),
-            description: "Account has not logged in for 365 days".to_string(),
-            tiers_involved: vec![Tier::Tier2],
-            remediation: "Review account necessity and disable if no longer needed".to_string(),
-        },
-    ])
-}
-
 /// Check for service accounts with interactive logon capability
 #[cfg(windows)]
 pub fn check_service_account_logon(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
@@ -277,32 +227,6 @@ pub fn check_service_account_logon(domain_dn: &str) -> Result<Vec<ComplianceViol
     }
 
     Ok(violations)
-}
-
-#[cfg(not(windows))]
-pub fn check_service_account_logon(_domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
-    Ok(vec![
-        ComplianceViolation {
-            violation_type: ViolationType::ServiceAccountInteractiveLogon,
-            severity: ViolationSeverity::High,
-            object_name: "svc.webapp".to_string(),
-            object_dn: "CN=svc.webapp,OU=ServiceAccounts,OU=Tier1,DC=contoso,DC=com".to_string(),
-            sam_account_name: "svc.webapp".to_string(),
-            description: "Service account is not marked as sensitive and may be capable of interactive logon".to_string(),
-            tiers_involved: vec![Tier::Tier1],
-            remediation: "Apply 'Deny log on locally' via GPO to service accounts".to_string(),
-        },
-        ComplianceViolation {
-            violation_type: ViolationType::ServiceAccountInteractiveLogon,
-            severity: ViolationSeverity::High,
-            object_name: "svc.sqlserver".to_string(),
-            object_dn: "CN=svc.sqlserver,OU=ServiceAccounts,OU=Tier1,DC=contoso,DC=com".to_string(),
-            sam_account_name: "svc.sqlserver".to_string(),
-            description: "Service account is not marked as sensitive and may be capable of interactive logon".to_string(),
-            tiers_involved: vec![Tier::Tier1],
-            remediation: "Apply 'Deny log on locally' via GPO to service accounts".to_string(),
-        },
-    ])
 }
 
 /// Check objects in wrong tier OUs based on group membership
@@ -431,32 +355,6 @@ pub fn check_wrong_tier_placement(domain_dn: &str) -> Result<Vec<ComplianceViola
     }
 
     Ok(violations)
-}
-
-#[cfg(not(windows))]
-pub fn check_wrong_tier_placement(_domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
-    Ok(vec![
-        ComplianceViolation {
-            violation_type: ViolationType::WrongTierPlacement,
-            severity: ViolationSeverity::Medium,
-            object_name: "WS001".to_string(),
-            object_dn: "CN=WS001,OU=Computers,OU=Tier1,DC=contoso,DC=com".to_string(),
-            sam_account_name: "WS001$".to_string(),
-            description: "Computer is in Tier1 but has group membership in Tier2 group".to_string(),
-            tiers_involved: vec![Tier::Tier1, Tier::Tier2],
-            remediation: "Move workstation to OU=Computers,OU=Tier2 or remove from Tier2 groups".to_string(),
-        },
-        ComplianceViolation {
-            violation_type: ViolationType::WrongTierPlacement,
-            severity: ViolationSeverity::Critical,
-            object_name: "admin.jones".to_string(),
-            object_dn: "CN=Admin Jones,OU=Users,OU=Tier2,DC=contoso,DC=com".to_string(),
-            sam_account_name: "admin.jones".to_string(),
-            description: "User is in Tier2 but has group membership in Tier0-Admins".to_string(),
-            tiers_involved: vec![Tier::Tier2, Tier::Tier0],
-            remediation: "Move user to OU=Users,OU=Tier0 or remove from Tier0 groups".to_string(),
-        },
-    ])
 }
 
 /// Get full compliance status

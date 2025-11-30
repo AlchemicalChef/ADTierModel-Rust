@@ -2,6 +2,7 @@ pub mod commands;
 pub mod domain;
 pub mod error;
 pub mod infrastructure;
+pub mod logging;
 
 use commands::{
     add_to_tier_group, check_tier_initialization, create_admin_account, get_domain_info,
@@ -14,6 +15,11 @@ use commands::{
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Initialize logging to ADTier.log in executable directory
+    let _guard = logging::init_logging();
+
+    tracing::info!("AD Tier Model application starting");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())

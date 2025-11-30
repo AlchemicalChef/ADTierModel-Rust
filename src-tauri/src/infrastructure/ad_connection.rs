@@ -8,10 +8,10 @@ use crate::error::{AppError, AppResult};
 
 #[cfg(windows)]
 use windows::{
-    core::{BSTR, PCWSTR, VARIANT},
+    core::{BSTR, Interface, PCWSTR},
+    Win32::Foundation::SysStringLen,
     Win32::Networking::ActiveDirectory::*,
     Win32::System::Com::*,
-    Win32::System::Ole::*,
     Win32::System::Variant::*,
 };
 
@@ -33,12 +33,14 @@ impl AdConnection {
     /// Connect to Active Directory using current Windows credentials
     #[cfg(windows)]
     pub fn connect() -> AppResult<Self> {
+        tracing::info!("Attempting to connect to Active Directory");
         unsafe {
             // Initialize COM
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-                .map_err(|e| AppError::WindowsError(format!("COM initialization failed: {}", e)))?;
+            tracing::debug!("Initializing COM");
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
             // Connect to RootDSE to get domain info
+            tracing::debug!("Connecting to RootDSE");
             let root_dse_path = BSTR::from("LDAP://RootDSE");
             let mut root_dse: Option<IADs> = None;
 
@@ -46,24 +48,31 @@ impl AdConnection {
                 PCWSTR(root_dse_path.as_ptr()),
                 PCWSTR::null(),  // Use current credentials
                 PCWSTR::null(),
-                ADS_SECURE_AUTHENTICATION.0 as u32,
-                &IADs::IID,
+                ADS_SECURE_AUTHENTICATION,
+                &<IADs as Interface>::IID,
                 &mut root_dse as *mut _ as *mut *mut std::ffi::c_void,
             )
-            .map_err(|e| AppError::AuthenticationFailed(format!("Failed to connect to AD: {}", e)))?;
+            .map_err(|e| {
+                tracing::error!("Failed to connect to AD: {}", e);
+                AppError::AuthenticationFailed(format!("Failed to connect to AD: {}", e))
+            })?;
 
             let root_dse = root_dse.ok_or_else(|| {
+                tracing::error!("RootDSE connection returned null");
                 AppError::NotConnected
             })?;
 
             // Get defaultNamingContext (domain DN)
             let domain_dn = Self::get_ads_property(&root_dse, "defaultNamingContext")?;
+            tracing::debug!("Retrieved domain DN: {}", domain_dn);
 
             // Get dnsHostName or construct from domain DN
             let dns_root = Self::domain_dn_to_dns(&domain_dn);
+            tracing::debug!("DNS root: {}", dns_root);
 
             // Get NetBIOS name from configuration partition
-            let netbios_name = Self::get_netbios_name(&domain_dn).unwrap_or_else(|_| {
+            let netbios_name = Self::get_netbios_name(&domain_dn).unwrap_or_else(|e| {
+                tracing::warn!("Failed to get NetBIOS name from config: {}, using fallback", e);
                 // Fallback: extract from domain DN
                 domain_dn
                     .split(',')
@@ -71,7 +80,9 @@ impl AdConnection {
                     .map(|s| s.trim_start_matches("DC=").to_uppercase())
                     .unwrap_or_else(|| "UNKNOWN".to_string())
             });
+            tracing::debug!("NetBIOS name: {}", netbios_name);
 
+            tracing::info!("Successfully connected to AD domain: {} ({})", dns_root, netbios_name);
             Ok(Self {
                 domain_dn,
                 dns_root,
@@ -81,18 +92,16 @@ impl AdConnection {
         }
     }
 
-    /// Non-Windows fallback - returns error
-    #[cfg(not(windows))]
-    pub fn connect() -> AppResult<Self> {
-        Err(AppError::NotConnected)
-    }
-
     /// Get a property from an IADs object
     #[cfg(windows)]
     unsafe fn get_ads_property(ads: &IADs, property: &str) -> AppResult<String> {
+        tracing::debug!("Getting AD property: {}", property);
         let prop_name = BSTR::from(property);
-        let value = ads.Get(PCWSTR(prop_name.as_ptr()))
-            .map_err(|e| AppError::LdapError(format!("Failed to get {}: {}", property, e)))?;
+        let value = ads.Get(&prop_name)
+            .map_err(|e| {
+                tracing::error!("Failed to get property {}: {}", property, e);
+                AppError::LdapError(format!("Failed to get {}: {}", property, e))
+            })?;
 
         Self::variant_to_string(&value)
     }
@@ -104,11 +113,11 @@ impl AdConnection {
 
         if vt == VT_BSTR {
             let bstr = &var.Anonymous.Anonymous.Anonymous.bstrVal;
-            let len = SysStringLen(*bstr) as usize;
+            let len = SysStringLen(&**bstr) as usize;
             if len == 0 {
                 return Ok(String::new());
             }
-            let slice = std::slice::from_raw_parts(bstr.0, len);
+            let slice = std::slice::from_raw_parts((**bstr).as_ptr(), len);
             let os_string = OsString::from_wide(slice);
             os_string.into_string()
                 .map_err(|_| AppError::LdapError("Invalid UTF-16 string".to_string()))
@@ -134,6 +143,7 @@ impl AdConnection {
     /// Get NetBIOS name from AD configuration
     #[cfg(windows)]
     unsafe fn get_netbios_name(domain_dn: &str) -> AppResult<String> {
+        tracing::debug!("Querying NetBIOS name from configuration partition");
         // Query the Partitions container in the Configuration NC
         let config_path = format!(
             "LDAP://CN=Partitions,CN=Configuration,{}",
@@ -146,26 +156,35 @@ impl AdConnection {
             PCWSTR(config_bstr.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION.0 as u32,
-            &IDirectorySearch::IID,
+            ADS_SECURE_AUTHENTICATION,
+            &<IDirectorySearch as Interface>::IID,
             &mut search as *mut _ as *mut *mut std::ffi::c_void,
         )
-        .map_err(|e| AppError::LdapError(format!("Failed to open config partition: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!("Failed to open config partition: {}", e);
+            AppError::LdapError(format!("Failed to open config partition: {}", e))
+        })?;
 
-        let search = search.ok_or(AppError::LdapError("Search interface not available".to_string()))?;
+        let search = search.ok_or_else(|| {
+            tracing::error!("Search interface not available for config partition");
+            AppError::LdapError("Search interface not available".to_string())
+        })?;
 
         // Search for the partition with matching nCName
         let filter = BSTR::from(format!("(&(objectClass=crossRef)(nCName={}))", domain_dn).as_str());
-        let attrs: [PCWSTR; 1] = [PCWSTR(BSTR::from("nETBIOSName").as_ptr())];
+        // Keep BSTR alive for the duration of the search
+        let attr_name_bstr = BSTR::from("nETBIOSName");
+        let attrs: [PCWSTR; 1] = [PCWSTR(attr_name_bstr.as_ptr())];
 
-        let mut search_handle: ADS_SEARCH_HANDLE = std::ptr::null_mut();
-        search.ExecuteSearch(
+        let search_handle = search.ExecuteSearch(
             PCWSTR(filter.as_ptr()),
-            Some(&attrs as *const _ as *mut PCWSTR),
+            attrs.as_ptr(),
             1,
-            &mut search_handle,
         )
-        .map_err(|e| AppError::LdapError(format!("Search failed: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!("NetBIOS name search failed: {}", e);
+            AppError::LdapError(format!("Search failed: {}", e))
+        })?;
 
         // Get first row
         if search.GetFirstRow(search_handle).is_ok() {
@@ -175,15 +194,16 @@ impl AdConnection {
             if search.GetColumn(search_handle, PCWSTR(attr_name.as_ptr()), &mut column).is_ok() {
                 if !column.pADsValues.is_null() && column.dwNumValues > 0 {
                     let value = &*column.pADsValues;
-                    if value.dwType == ADSTYPE_CASE_IGNORE_STRING.0 as u32
-                        || value.dwType == ADSTYPE_DN_STRING.0 as u32 {
-                        let ptr = value.Anonymous.CaseIgnoreString.0;
+                    if value.dwType == ADSTYPE_CASE_IGNORE_STRING
+                        || value.dwType == ADSTYPE_DN_STRING {
+                        let ptr = value.Anonymous.CaseIgnoreString;
                         if !ptr.is_null() {
                             let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
                             let slice = std::slice::from_raw_parts(ptr, len);
                             let result = String::from_utf16_lossy(slice);
                             search.FreeColumn(&mut column).ok();
                             search.CloseSearchHandle(search_handle).ok();
+                            tracing::debug!("Found NetBIOS name: {}", result);
                             return Ok(result);
                         }
                     }
@@ -193,6 +213,7 @@ impl AdConnection {
         }
 
         search.CloseSearchHandle(search_handle).ok();
+        tracing::warn!("NetBIOS name not found in configuration partition");
         Err(AppError::LdapError("NetBIOS name not found".to_string()))
     }
 
@@ -220,12 +241,5 @@ impl Drop for AdConnection {
 
 /// Check if running on Windows and can connect to AD
 pub fn is_ad_available() -> bool {
-    #[cfg(windows)]
-    {
-        AdConnection::connect().is_ok()
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    AdConnection::connect().is_ok()
 }

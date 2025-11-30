@@ -9,11 +9,17 @@ import {
   Cog6ToothIcon,
   ShieldCheckIcon,
   SignalIcon,
+  BuildingOfficeIcon,
+  CheckCircleIcon,
+  ExclamationTriangleIcon,
+  XCircleIcon,
 } from "@heroicons/react/24/outline";
 import { useSettingsStore, type ThemeMode, type RefreshInterval } from "../../store/settingsStore";
 import { useTierStore } from "../../store/tierStore";
 import { GpoManagementPanel } from "../gpo";
 import { HealthCheckPanel } from "../health";
+import { initializeAdTierModel, checkTierInitialization } from "../../services/tauri";
+import type { InitializationResult, InitializationStatus } from "../../types/tier";
 
 const themeOptions: { value: ThemeMode; label: string; icon: React.ElementType }[] = [
   { value: "light", label: "Light", icon: SunIcon },
@@ -32,6 +38,11 @@ type SettingsView = "general" | "gpo" | "health";
 
 export function SettingsPanel() {
   const [activeView, setActiveView] = useState<SettingsView>("general");
+  const [initStatus, setInitStatus] = useState<InitializationStatus | null>(null);
+  const [initResult, setInitResult] = useState<InitializationResult | null>(null);
+  const [isInitializing, setIsInitializing] = useState(false);
+  const [isCheckingStatus, setIsCheckingStatus] = useState(false);
+
   const {
     theme,
     staleAccountThresholdDays,
@@ -43,6 +54,50 @@ export function SettingsPanel() {
   } = useSettingsStore();
 
   const { domainInfo } = useTierStore();
+
+  const handleCheckStatus = async () => {
+    setIsCheckingStatus(true);
+    try {
+      const status = await checkTierInitialization();
+      setInitStatus(status);
+    } catch (error) {
+      console.error("Failed to check initialization status:", error);
+    } finally {
+      setIsCheckingStatus(false);
+    }
+  };
+
+  const handleInitialize = async (options: {
+    createOuStructure: boolean;
+    createGroups: boolean;
+    setPermissions: boolean;
+    createGpos: boolean;
+  }) => {
+    setIsInitializing(true);
+    setInitResult(null);
+    try {
+      const result = await initializeAdTierModel({
+        ...options,
+        force: false,
+      });
+      setInitResult(result);
+      // Refresh status after initialization
+      await handleCheckStatus();
+    } catch (error) {
+      console.error("Initialization failed:", error);
+      setInitResult({
+        success: false,
+        ousCreated: [],
+        groupsCreated: [],
+        permissionsSet: [],
+        gposCreated: [],
+        warnings: [],
+        errors: [String(error)],
+      });
+    } finally {
+      setIsInitializing(false);
+    }
+  };
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
@@ -229,6 +284,204 @@ export function SettingsPanel() {
             Automatically refresh tier data and compliance status.
           </p>
         </div>
+      </section>
+
+      {/* Tier Structure Initialization */}
+      <section className="bg-white dark:bg-surface-850 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+        <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3 flex items-center gap-2">
+          <BuildingOfficeIcon className="w-4 h-4" />
+          Tier Structure Initialization
+        </h3>
+        <p className="text-xs text-gray-400 dark:text-gray-500 mb-4">
+          Initialize or reinitialize the AD tier model structure including OUs, groups, and GPOs.
+        </p>
+
+        {/* Check Status Button */}
+        <div className="mb-4">
+          <button
+            onClick={handleCheckStatus}
+            disabled={isCheckingStatus}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-colors disabled:opacity-50"
+          >
+            {isCheckingStatus ? (
+              <ArrowPathIcon className="w-4 h-4 animate-spin" />
+            ) : (
+              <SignalIcon className="w-4 h-4" />
+            )}
+            Check Current Status
+          </button>
+        </div>
+
+        {/* Status Display */}
+        {initStatus && (
+          <div className="mb-4 p-3 bg-gray-50 dark:bg-surface-800 rounded-lg">
+            <h4 className="text-xs font-medium text-gray-600 dark:text-gray-400 mb-2">Current Status</h4>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div className="flex items-center gap-1">
+                {initStatus.tier0OuExists ? (
+                  <CheckCircleIcon className="w-4 h-4 text-green-500" />
+                ) : (
+                  <XCircleIcon className="w-4 h-4 text-red-500" />
+                )}
+                <span className="text-gray-600 dark:text-gray-400">Tier 0 OU</span>
+              </div>
+              <div className="flex items-center gap-1">
+                {initStatus.tier1OuExists ? (
+                  <CheckCircleIcon className="w-4 h-4 text-green-500" />
+                ) : (
+                  <XCircleIcon className="w-4 h-4 text-red-500" />
+                )}
+                <span className="text-gray-600 dark:text-gray-400">Tier 1 OU</span>
+              </div>
+              <div className="flex items-center gap-1">
+                {initStatus.tier2OuExists ? (
+                  <CheckCircleIcon className="w-4 h-4 text-green-500" />
+                ) : (
+                  <XCircleIcon className="w-4 h-4 text-red-500" />
+                )}
+                <span className="text-gray-600 dark:text-gray-400">Tier 2 OU</span>
+              </div>
+              <div className="flex items-center gap-1">
+                {initStatus.groupsExist ? (
+                  <CheckCircleIcon className="w-4 h-4 text-green-500" />
+                ) : (
+                  <XCircleIcon className="w-4 h-4 text-red-500" />
+                )}
+                <span className="text-gray-600 dark:text-gray-400">Groups</span>
+              </div>
+            </div>
+            {initStatus.missingComponents.length > 0 && (
+              <div className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+                Missing: {initStatus.missingComponents.join(", ")}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Initialize Buttons */}
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => handleInitialize({
+              createOuStructure: true,
+              createGroups: true,
+              setPermissions: true,
+              createGpos: true,
+            })}
+            disabled={isInitializing}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
+          >
+            {isInitializing ? (
+              <ArrowPathIcon className="w-4 h-4 animate-spin" />
+            ) : (
+              <ShieldCheckIcon className="w-4 h-4" />
+            )}
+            Initialize All
+          </button>
+          <button
+            onClick={() => handleInitialize({
+              createOuStructure: true,
+              createGroups: false,
+              setPermissions: false,
+              createGpos: false,
+            })}
+            disabled={isInitializing}
+            className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-surface-700 rounded-lg hover:bg-gray-200 dark:hover:bg-surface-600 transition-colors disabled:opacity-50"
+          >
+            OUs Only
+          </button>
+          <button
+            onClick={() => handleInitialize({
+              createOuStructure: false,
+              createGroups: true,
+              setPermissions: false,
+              createGpos: false,
+            })}
+            disabled={isInitializing}
+            className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-surface-700 rounded-lg hover:bg-gray-200 dark:hover:bg-surface-600 transition-colors disabled:opacity-50"
+          >
+            Groups Only
+          </button>
+          <button
+            onClick={() => handleInitialize({
+              createOuStructure: false,
+              createGroups: false,
+              setPermissions: false,
+              createGpos: true,
+            })}
+            disabled={isInitializing}
+            className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-surface-700 rounded-lg hover:bg-gray-200 dark:hover:bg-surface-600 transition-colors disabled:opacity-50"
+          >
+            GPOs Only
+          </button>
+        </div>
+
+        {/* Initialization Result */}
+        {initResult && (
+          <div className={`mt-4 p-3 rounded-lg ${
+            initResult.success
+              ? "bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800"
+              : "bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800"
+          }`}>
+            <div className="flex items-center gap-2 mb-2">
+              {initResult.success ? (
+                <CheckCircleIcon className="w-5 h-5 text-green-600 dark:text-green-400" />
+              ) : (
+                <XCircleIcon className="w-5 h-5 text-red-600 dark:text-red-400" />
+              )}
+              <span className={`text-sm font-medium ${
+                initResult.success
+                  ? "text-green-700 dark:text-green-300"
+                  : "text-red-700 dark:text-red-300"
+              }`}>
+                {initResult.success ? "Initialization Complete" : "Initialization Failed"}
+              </span>
+            </div>
+
+            {initResult.ousCreated.length > 0 && (
+              <div className="text-xs text-gray-600 dark:text-gray-400 mb-1">
+                OUs Created: {initResult.ousCreated.length}
+              </div>
+            )}
+            {initResult.groupsCreated.length > 0 && (
+              <div className="text-xs text-gray-600 dark:text-gray-400 mb-1">
+                Groups Created: {initResult.groupsCreated.length}
+              </div>
+            )}
+            {initResult.gposCreated.length > 0 && (
+              <div className="text-xs text-gray-600 dark:text-gray-400 mb-1">
+                GPOs Created: {initResult.gposCreated.length}
+              </div>
+            )}
+
+            {initResult.warnings.length > 0 && (
+              <div className="mt-2">
+                <div className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400 mb-1">
+                  <ExclamationTriangleIcon className="w-3 h-3" />
+                  Warnings:
+                </div>
+                <ul className="text-xs text-amber-700 dark:text-amber-300 list-disc list-inside">
+                  {initResult.warnings.map((w, i) => (
+                    <li key={i}>{w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {initResult.errors.length > 0 && (
+              <div className="mt-2">
+                <div className="flex items-center gap-1 text-xs text-red-600 dark:text-red-400 mb-1">
+                  <XCircleIcon className="w-3 h-3" />
+                  Errors:
+                </div>
+                <ul className="text-xs text-red-700 dark:text-red-300 list-disc list-inside">
+                  {initResult.errors.map((e, i) => (
+                    <li key={i}>{e}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
       </section>
 
       {/* Reset */}
