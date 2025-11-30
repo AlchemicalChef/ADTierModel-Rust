@@ -9,6 +9,7 @@ import {
   ClockIcon,
   Cog6ToothIcon,
   HomeIcon,
+  FingerPrintIcon,
 } from "@heroicons/react/24/outline";
 import { useTierStore } from "./store/tierStore";
 import { tierConfig } from "./types/tier";
@@ -19,6 +20,7 @@ import { ComplianceDashboard } from "./components/compliance";
 import { AuditLogPanel } from "./components/audit";
 import { SettingsPanel } from "./components/settings";
 import { DashboardOverview } from "./components/dashboard";
+import { EndpointProtectionPanel } from "./components/endpoint-protection";
 import { InitializationWizard } from "./components/initialization/InitializationWizard";
 import { ToastContainer } from "./components/notifications";
 import { useDomainConnection, useTierCounts, useAllTierData, useInitializationStatus, useAutoRefresh } from "./hooks/useTierData";
@@ -58,7 +60,14 @@ interface DashboardTab {
   label: string;
 }
 
-type AppTab = TierTab | ComplianceTab | AuditTab | SettingsTab | DashboardTab;
+interface EndpointProtectionTab {
+  id: string;
+  type: "endpoint-protection";
+  icon: React.ElementType;
+  label: string;
+}
+
+type AppTab = TierTab | ComplianceTab | AuditTab | SettingsTab | DashboardTab | EndpointProtectionTab;
 
 const tabs: AppTab[] = [
   { id: "dashboard", type: "dashboard", icon: HomeIcon, label: "Dashboard" },
@@ -66,6 +75,7 @@ const tabs: AppTab[] = [
   { id: "tier1", type: "tier", tier: "Tier1", icon: ServerIcon },
   { id: "tier2", type: "tier", tier: "Tier2", icon: ComputerDesktopIcon },
   { id: "unassigned", type: "tier", tier: "Unassigned", icon: QuestionMarkCircleIcon },
+  { id: "endpoint-protection", type: "endpoint-protection", icon: FingerPrintIcon, label: "Endpoint Protection" },
   { id: "compliance", type: "compliance", icon: ShieldExclamationIcon, label: "Compliance" },
   { id: "audit", type: "audit", icon: ClockIcon, label: "Audit Log" },
   { id: "settings", type: "settings", icon: Cog6ToothIcon, label: "Settings" },
@@ -166,6 +176,24 @@ function App() {
                     </span>
                   </Tab>
                 );
+              } else if (tab.type === "endpoint-protection") {
+                // Endpoint Protection tab
+                return (
+                  <Tab
+                    key={tab.id}
+                    className={({ selected }) =>
+                      `flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all outline-none
+                       ${
+                         selected
+                           ? "bg-cyan-100 dark:bg-cyan-900/50 text-cyan-800 dark:text-cyan-200 shadow-sm"
+                           : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-surface-700"
+                       }`
+                    }
+                  >
+                    <tab.icon className="h-5 w-5" />
+                    <span className="hidden sm:inline">{tab.label}</span>
+                  </Tab>
+                );
               } else if (tab.type === "compliance") {
                 // Compliance tab
                 return (
@@ -238,6 +266,8 @@ function App() {
                   />
                 ) : tab.type === "tier" ? (
                   <TierTabPanel tier={tab.tier} />
+                ) : tab.type === "endpoint-protection" ? (
+                  <EndpointProtectionPanel />
                 ) : tab.type === "compliance" ? (
                   <ComplianceDashboard />
                 ) : tab.type === "audit" ? (

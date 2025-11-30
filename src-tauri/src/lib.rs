@@ -11,6 +11,9 @@ use commands::{
     reconnect_ad, remove_from_tier_group, get_compliance_status, get_cross_tier_violations,
     get_object_groups, get_gpo_status, configure_tier_gpo, configure_all_gpos, delete_tier_gpo,
     bulk_disable_stale_accounts, harden_service_accounts,
+    // Endpoint protection
+    get_endpoint_protection_status, configure_endpoint_gpo, configure_all_endpoint_gpos,
+    delete_endpoint_gpo_cmd,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -56,6 +59,11 @@ pub fn run() {
             // Account Management
             bulk_disable_stale_accounts,
             harden_service_accounts,
+            // Endpoint Protection GPOs
+            get_endpoint_protection_status,
+            configure_endpoint_gpo,
+            configure_all_endpoint_gpos,
+            delete_endpoint_gpo_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

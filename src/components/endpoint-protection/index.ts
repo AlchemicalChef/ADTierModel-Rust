@@ -1,0 +1,1 @@
+export { EndpointProtectionPanel } from "./EndpointProtectionPanel";

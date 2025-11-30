@@ -274,3 +274,57 @@ export interface HardenAccountsResult {
 export async function hardenServiceAccounts(objectDns: string[]): Promise<HardenAccountsResult> {
   return tauriCommand("harden_service_accounts", { objectDns });
 }
+
+// Endpoint Protection GPO types
+export interface TierLinkStatus {
+  tier: string;
+  linked: boolean;
+  linkEnabled: boolean;
+}
+
+export interface EndpointGpoStatus {
+  gpoType: string;
+  name: string;
+  description: string;
+  exists: boolean;
+  linked: boolean;
+  linkTarget: string;
+  linkScope: string;
+  created: string | null;
+  modified: string | null;
+  tierStatus: TierLinkStatus[] | null;
+}
+
+export interface EndpointGpoConfigResult {
+  success: boolean;
+  gpoType: string;
+  gpoName: string;
+  created: boolean;
+  linked: boolean;
+  configured: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+// Endpoint Protection GPO commands
+export async function getEndpointProtectionStatus(): Promise<EndpointGpoStatus[]> {
+  return tauriCommand("get_endpoint_protection_status");
+}
+
+export async function configureEndpointGpo(
+  gpoType: string,
+  tier?: TierLevel
+): Promise<EndpointGpoConfigResult> {
+  return tauriCommand("configure_endpoint_gpo", { gpoType, tier });
+}
+
+export async function configureAllEndpointGpos(): Promise<EndpointGpoConfigResult[]> {
+  return tauriCommand("configure_all_endpoint_gpos");
+}
+
+export async function deleteEndpointGpo(
+  gpoType: string,
+  tier?: TierLevel
+): Promise<void> {
+  return tauriCommand("delete_endpoint_gpo_cmd", { gpoType, tier });
+}

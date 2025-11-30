@@ -223,6 +223,52 @@ pub fn get_all_gpo_status(domain_dn: &str) -> AppResult<Vec<TierGpoStatus>> {
     Ok(statuses)
 }
 
+/// Generate PowerShell script to harden GPO permissions for tier-matched access control
+/// This removes CREATOR OWNER permissions and grants edit rights to the appropriate tier admin group
+pub fn generate_gpo_permission_hardening_script(gpo_name: &str, tier_admin_group: &str) -> String {
+    format!(
+        r#"
+        # Harden GPO permissions for {gpo_name}
+        try {{
+            $gpo = Get-GPO -Name '{gpo_name}' -ErrorAction Stop
+            $gpoGuid = $gpo.Id
+
+            # Remove CREATOR OWNER permissions (S-1-3-0)
+            try {{
+                Set-GPPermission -Guid $gpoGuid -TargetName 'S-1-3-0' -TargetType WellKnownGroup -PermissionLevel None -Replace -ErrorAction SilentlyContinue
+                $results.warnings += "Removed CREATOR OWNER permissions from {gpo_name}"
+            }} catch {{
+                $results.warnings += "Could not remove CREATOR OWNER from {gpo_name}: $($_.Exception.Message)"
+            }}
+
+            # Grant tier admin group full edit rights
+            try {{
+                Set-GPPermission -Guid $gpoGuid -TargetName '{tier_admin_group}' -TargetType Group -PermissionLevel GpoEditDeleteModifySecurity -ErrorAction Stop
+                $results.warnings += "Granted {tier_admin_group} edit rights on {gpo_name}"
+            }} catch {{
+                $results.warnings += "Could not grant {tier_admin_group} permissions on {gpo_name}: $($_.Exception.Message)"
+            }}
+
+            # Ensure Authenticated Users can apply the GPO
+            try {{
+                Set-GPPermission -Guid $gpoGuid -TargetName 'Authenticated Users' -TargetType WellKnownGroup -PermissionLevel GpoApply -ErrorAction SilentlyContinue
+            }} catch {{
+                $results.warnings += "Could not set Authenticated Users permissions on {gpo_name}: $($_.Exception.Message)"
+            }}
+        }} catch {{
+            $results.warnings += "Could not harden permissions for {gpo_name}: $($_.Exception.Message)"
+        }}
+        "#,
+        gpo_name = gpo_name,
+        tier_admin_group = tier_admin_group,
+    )
+}
+
+/// Get the tier admin group name for a given tier
+pub fn get_tier_admin_group(tier: Tier) -> String {
+    format!("{}-Admins", tier)
+}
+
 /// Get the groups that should be denied for a tier
 fn get_deny_groups_for_tier(tier: Tier, logon_type: &str) -> Vec<String> {
     match tier {
@@ -513,6 +559,47 @@ gPCMachineExtensionNames=$cseGuids
 
             $results.configured += '{logon_name}'
 
+            # Harden GPO permissions for tier-matched access control
+            $tierAdminGroup = '{tier_admin_group}'
+
+            # Harden base policy GPO permissions
+            try {{
+                $baseGpoObj = Get-GPO -Name '{base_name}' -ErrorAction Stop
+                $baseGuid = $baseGpoObj.Id
+
+                # Remove CREATOR OWNER permissions
+                Set-GPPermission -Guid $baseGuid -TargetName 'S-1-3-0' -TargetType WellKnownGroup -PermissionLevel None -Replace -ErrorAction SilentlyContinue
+
+                # Grant tier admin group full edit rights
+                Set-GPPermission -Guid $baseGuid -TargetName $tierAdminGroup -TargetType Group -PermissionLevel GpoEditDeleteModifySecurity -ErrorAction SilentlyContinue
+
+                # Ensure Authenticated Users can apply
+                Set-GPPermission -Guid $baseGuid -TargetName 'Authenticated Users' -TargetType WellKnownGroup -PermissionLevel GpoApply -ErrorAction SilentlyContinue
+
+                $results.warnings += "Hardened permissions on {base_name} for $tierAdminGroup"
+            }} catch {{
+                $results.warnings += "Could not harden {base_name} permissions: $($_.Exception.Message)"
+            }}
+
+            # Harden logon restrictions GPO permissions
+            try {{
+                $logonGpoObj = Get-GPO -Name '{logon_name}' -ErrorAction Stop
+                $logonGuid = $logonGpoObj.Id
+
+                # Remove CREATOR OWNER permissions
+                Set-GPPermission -Guid $logonGuid -TargetName 'S-1-3-0' -TargetType WellKnownGroup -PermissionLevel None -Replace -ErrorAction SilentlyContinue
+
+                # Grant tier admin group full edit rights
+                Set-GPPermission -Guid $logonGuid -TargetName $tierAdminGroup -TargetType Group -PermissionLevel GpoEditDeleteModifySecurity -ErrorAction SilentlyContinue
+
+                # Ensure Authenticated Users can apply
+                Set-GPPermission -Guid $logonGuid -TargetName 'Authenticated Users' -TargetType WellKnownGroup -PermissionLevel GpoApply -ErrorAction SilentlyContinue
+
+                $results.warnings += "Hardened permissions on {logon_name} for $tierAdminGroup"
+            }} catch {{
+                $results.warnings += "Could not harden {logon_name} permissions: $($_.Exception.Message)"
+            }}
+
         }} catch {{
             $results.errors += "Exception: $($_.Exception.Message)"
             $results.debug += "Full error: $_"
@@ -528,6 +615,7 @@ gPCMachineExtensionNames=$cseGuids
         deny_rdp = deny_rdp_str,
         deny_network = deny_network_str,
         apply_network_deny = if apply_network_deny { "$true" } else { "$false" },
+        tier_admin_group = get_tier_admin_group(tier),
     );
 
     tracing::info!(tier = tier_name.as_str(), "Configuring GPOs for tier");
