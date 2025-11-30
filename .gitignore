@@ -8,7 +8,9 @@ dist-ssr/
 
 # Rust/Cargo
 src-tauri/target/
+src-tauri/.cargo/
 **/*.rs.bk
+Cargo.lock
 
 # IDE
 .vscode/
@@ -27,6 +29,7 @@ src-tauri/target/
 ehthumbs.db
 Thumbs.db
 desktop.ini
+nul
 
 # Environment
 .env
