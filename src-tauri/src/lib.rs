@@ -9,7 +9,7 @@ use commands::{
     get_expected_groups, get_expected_ou_structure, get_tier_counts, get_tier_members,
     get_tier0_infrastructure, initialize_ad_tier_model, move_object_to_tier, move_tier0_component,
     reconnect_ad, remove_from_tier_group, get_compliance_status, get_cross_tier_violations,
-    get_object_groups, get_gpo_status, configure_tier_gpo, configure_all_gpos, delete_tier_gpo,
+    get_object_groups, get_group_members, get_gpo_status, configure_tier_gpo, configure_all_gpos, delete_tier_gpo,
     bulk_disable_stale_accounts, harden_service_accounts,
     // Endpoint protection
     get_endpoint_protection_status, configure_endpoint_gpo, configure_all_endpoint_gpos,
@@ -36,6 +36,7 @@ pub fn run() {
             get_tier_members,
             get_tier0_infrastructure,
             get_object_groups,
+            get_group_members,
             // Initialization
             check_tier_initialization,
             initialize_ad_tier_model,

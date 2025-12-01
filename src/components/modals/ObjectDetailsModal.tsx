@@ -26,7 +26,7 @@ import type { TierMember, Tier0RoleType, TierLevel } from "../../types/tier";
 import { tierConfig } from "../../types/tier";
 import { MoveObjectModal } from "./MoveObjectModal";
 import { GroupMembershipModal } from "./GroupMembershipModal";
-import { getObjectGroups } from "../../services/tauri";
+import { getObjectGroups, getGroupMembers } from "../../services/tauri";
 
 interface ObjectDetailsModalProps {
   member: TierMember | null;
@@ -168,6 +168,113 @@ function DetailRow({ label, value, icon: Icon, copyable, mono }: DetailRowProps)
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+// Group members section - shows members of a group when expanded
+function GroupMembersSection({ groupDn, memberCount }: { groupDn: string; memberCount: number }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const { data: members, isLoading, error } = useQuery({
+    queryKey: ["groupMembers", groupDn],
+    queryFn: () => getGroupMembers(groupDn),
+    enabled: expanded, // Only fetch when expanded
+    staleTime: 30_000,
+  });
+
+  const getObjectIcon = (objectType: string) => {
+    switch (objectType) {
+      case "Computer":
+        return ComputerDesktopIcon;
+      case "Group":
+        return UserGroupIcon;
+      case "User":
+      default:
+        return UserIcon;
+    }
+  };
+
+  return (
+    <div className="py-3 border-b border-gray-100 dark:border-gray-700">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full text-left"
+      >
+        <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400 mb-1">
+          <UserGroupIcon className="w-3.5 h-3.5" />
+          Group Members
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-sm text-gray-900 dark:text-gray-100">
+            {memberCount} member{memberCount !== 1 ? "s" : ""}
+          </span>
+          <div className="flex items-center gap-1 text-blue-600 dark:text-blue-400 text-xs">
+            <span>{expanded ? "Hide" : "Show"}</span>
+            {expanded ? (
+              <ChevronUpIcon className="w-4 h-4" />
+            ) : (
+              <ChevronDownIcon className="w-4 h-4" />
+            )}
+          </div>
+        </div>
+      </button>
+
+      {expanded && (
+        <div className="mt-3 space-y-2">
+          {isLoading && (
+            <div className="flex items-center justify-center py-4">
+              <ArrowPathIcon className="w-5 h-5 animate-spin text-gray-400" />
+            </div>
+          )}
+
+          {error && (
+            <div className="text-sm text-red-600 dark:text-red-400 py-2">
+              Failed to load group members
+            </div>
+          )}
+
+          {members && members.length === 0 && (
+            <div className="text-sm text-gray-500 dark:text-gray-400 py-2">
+              No members found
+            </div>
+          )}
+
+          {members && members.length > 0 && (
+            <div className="max-h-48 overflow-y-auto space-y-2">
+              {members.map((m) => {
+                const MemberIcon = getObjectIcon(m.objectType);
+                return (
+                  <div
+                    key={m.distinguishedName}
+                    className="flex items-center gap-2 p-2 bg-gray-50 dark:bg-surface-900 rounded-lg"
+                  >
+                    <MemberIcon className={`w-4 h-4 flex-shrink-0 ${m.enabled ? "text-gray-400" : "text-gray-300"}`} />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className={`text-sm font-medium truncate ${m.enabled ? "text-gray-900 dark:text-gray-100" : "text-gray-400 dark:text-gray-500"}`}>
+                          {m.name}
+                        </span>
+                        {!m.enabled && (
+                          <span className="px-1.5 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 rounded">
+                            Disabled
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 font-mono truncate">
+                        {m.samAccountName}
+                      </p>
+                    </div>
+                    <span className="text-xs text-gray-400 dark:text-gray-500">
+                      {m.objectType}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -437,11 +544,10 @@ export function ObjectDetailsModal({
                   />
                 )}
 
-                {member.memberCount !== null && (
-                  <DetailRow
-                    label="Group Members"
-                    value={`${member.memberCount} member${member.memberCount !== 1 ? "s" : ""}`}
-                    icon={UserGroupIcon}
+                {member.memberCount !== null && member.objectType === "Group" && (
+                  <GroupMembersSection
+                    groupDn={member.distinguishedName}
+                    memberCount={member.memberCount}
                   />
                 )}
 

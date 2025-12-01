@@ -37,6 +37,7 @@ export function InitializationWizard({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<InitializationResult | null>(null);
+  const [showSkipWarning, setShowSkipWarning] = useState(false);
 
   // Options state
   const [options, setOptions] = useState<InitializationOptions>({
@@ -163,7 +164,7 @@ export function InitializationWizard({
 
           <div className="flex justify-end gap-3">
             <button
-              onClick={onSkip}
+              onClick={() => setShowSkipWarning(true)}
               className="px-4 py-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
             >
               Skip for Now
@@ -393,6 +394,53 @@ export function InitializationWizard({
     </div>
   );
 
+  const renderSkipWarning = () => (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[60]">
+      <div className="bg-white dark:bg-surface-800 rounded-xl shadow-2xl max-w-md w-full mx-4 p-6">
+        <div className="text-center mb-4">
+          <ExclamationTriangleIcon className="h-16 w-16 mx-auto text-amber-500" />
+          <h2 className="mt-4 text-xl font-semibold text-gray-900 dark:text-white">
+            Skip Initialization?
+          </h2>
+        </div>
+
+        <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-4 mb-4">
+          <p className="text-amber-800 dark:text-amber-200 text-sm font-medium mb-2">
+            Warning: Skipping initialization will result in incomplete data.
+          </p>
+          <ul className="text-amber-700 dark:text-amber-300 text-sm list-disc list-inside space-y-1">
+            <li>Tier assignments will not be accurate</li>
+            <li>Objects will appear as "Unassigned"</li>
+            <li>Compliance checks may show false violations</li>
+            <li>GPO restrictions will not be enforced</li>
+          </ul>
+        </div>
+
+        <p className="text-gray-600 dark:text-gray-400 text-sm mb-6">
+          The AD Tier Model requires the OU structure and security groups to be created before it can properly categorize and manage your Active Directory objects.
+        </p>
+
+        <div className="flex justify-end gap-3">
+          <button
+            onClick={() => setShowSkipWarning(false)}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            Go Back
+          </button>
+          <button
+            onClick={() => {
+              setShowSkipWarning(false);
+              onSkip();
+            }}
+            className="px-4 py-2 text-amber-700 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/30 hover:bg-amber-200 dark:hover:bg-amber-900/50 rounded-lg transition-colors"
+          >
+            Skip Anyway
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
   const renderCompleteStep = () => (
     <div className="space-y-6">
       <div className="text-center">
@@ -496,14 +544,17 @@ export function InitializationWizard({
   );
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white dark:bg-surface-800 rounded-xl shadow-2xl max-w-lg w-full mx-4 p-6">
-        {step === "check" && renderCheckStep()}
-        {step === "configure" && renderConfigureStep()}
-        {step === "preview" && renderPreviewStep()}
-        {step === "execute" && renderExecuteStep()}
-        {step === "complete" && renderCompleteStep()}
+    <>
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+        <div className="bg-white dark:bg-surface-800 rounded-xl shadow-2xl max-w-lg w-full mx-4 p-6">
+          {step === "check" && renderCheckStep()}
+          {step === "configure" && renderConfigureStep()}
+          {step === "preview" && renderPreviewStep()}
+          {step === "execute" && renderExecuteStep()}
+          {step === "complete" && renderCompleteStep()}
+        </div>
       </div>
-    </div>
+      {showSkipWarning && renderSkipWarning()}
+    </>
   );
 }

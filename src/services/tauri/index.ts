@@ -178,6 +178,20 @@ export async function getObjectGroups(objectDn: string): Promise<GroupMembership
   return tauriCommand("get_object_groups", { objectDn });
 }
 
+// Group member information
+export interface GroupMemberInfo {
+  name: string;
+  samAccountName: string;
+  distinguishedName: string;
+  objectType: string;
+  enabled: boolean;
+}
+
+// Get members of a group
+export async function getGroupMembers(groupDn: string): Promise<GroupMemberInfo[]> {
+  return tauriCommand("get_group_members", { groupDn });
+}
+
 // Admin account creation types
 export interface CreateAdminAccountOptions {
   baseUsername: string;

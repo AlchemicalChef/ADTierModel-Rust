@@ -637,3 +637,27 @@ pub async fn get_object_groups(object_dn: String) -> Result<Vec<GroupMembership>
 
     get_object_group_memberships(&object_dn).map_err(|e| format!("Failed to get groups: {}", e))
 }
+
+/// Get members of a group
+///
+/// # Arguments
+/// * `group_dn` - The distinguished name of the group
+/// * `include_nested` - If true, includes members from nested groups (transitive)
+#[tauri::command]
+pub async fn get_group_members(
+    group_dn: String,
+    include_nested: Option<bool>,
+) -> Result<Vec<crate::infrastructure::GroupMemberInfo>, String> {
+    use crate::infrastructure::get_group_members as get_members;
+
+    let nested = include_nested.unwrap_or(false);
+
+    // Run blocking LDAP queries in a separate thread
+    let handle = std::thread::spawn(move || {
+        get_members(&group_dn, nested)
+    });
+
+    handle.join()
+        .map_err(|_| "Query thread panicked".to_string())?
+        .map_err(|e| format!("Failed to get group members: {}", e))
+}

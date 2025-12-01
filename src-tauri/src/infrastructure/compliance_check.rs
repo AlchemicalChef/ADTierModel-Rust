@@ -10,7 +10,7 @@ use crate::domain::{
 use crate::infrastructure::ad_connection::AdConnection;
 
 #[cfg(windows)]
-use crate::infrastructure::ad_search::{ldap_search, SearchScope};
+use crate::infrastructure::ad_search::{ldap_search, SearchScope, escape_ldap_filter};
 
 /// Get the domain DN for compliance checks
 #[cfg(windows)]
@@ -21,9 +21,14 @@ pub fn get_domain_dn() -> Result<String, String> {
 
 /// Check for cross-tier access violations
 /// Returns accounts that have membership in groups across multiple tiers
+///
+/// Uses LDAP_MATCHING_RULE_IN_CHAIN (1.2.840.113556.1.4.1941) for transitive
+/// group membership checking, which catches users who are members through
+/// nested groups.
 #[cfg(windows)]
 pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, String> {
     use std::collections::{HashMap, HashSet};
+    use crate::infrastructure::ad_search::LDAP_MATCHING_RULE_IN_CHAIN;
 
     let mut violations = Vec::new();
 
@@ -40,46 +45,47 @@ pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, 
         let group_results = ldap_search(
             &groups_ou,
             "(objectClass=group)",
-            &["name", "distinguishedName", "member"],
+            &["name", "distinguishedName"],
             SearchScope::OneLevel,
         ).unwrap_or_default();
 
         for group_result in group_results {
             let group_name = group_result.get("name").cloned().unwrap_or_default();
+            let group_dn = match group_result.get("distinguishedname") {
+                Some(dn) => dn.clone(),
+                None => continue,
+            };
 
-            // Get members of this group
-            if let Some(members) = group_result.get_all("member") {
-                for member_dn in members {
-                    // Look up the member to get their sAMAccountName
-                    if let Ok(member_results) = ldap_search(
-                        member_dn,
-                        "(objectClass=*)",
-                        &["sAMAccountName", "distinguishedName", "objectClass"],
-                        SearchScope::Base,
-                    ) {
-                        if let Some(member) = member_results.first() {
-                            // Only track users, not nested groups
-                            let obj_classes = member.get_all("objectclass")
-                                .map(|c| c.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>())
-                                .unwrap_or_default();
+            // Use LDAP_MATCHING_RULE_IN_CHAIN to find ALL users who are members
+            // of this group, including through nested group membership
+            let filter = format!(
+                "(&(objectCategory=person)(objectClass=user)(memberOf:{}:={}))",
+                LDAP_MATCHING_RULE_IN_CHAIN,
+                escape_ldap_filter(&group_dn)
+            );
 
-                            if obj_classes.contains(&"user".to_string()) {
-                                let sam = member.get("samaccountname").cloned().unwrap_or_default();
-                                if !sam.is_empty() {
-                                    user_tier_map
-                                        .entry(sam.clone())
-                                        .or_default()
-                                        .insert(*tier);
-                                    user_groups_map
-                                        .entry(sam.clone())
-                                        .or_default()
-                                        .push(group_name.clone());
-                                    user_dn_map
-                                        .entry(sam)
-                                        .or_insert_with(|| member_dn.clone());
-                                }
-                            }
-                        }
+            if let Ok(user_results) = ldap_search(
+                domain_dn,
+                &filter,
+                &["sAMAccountName", "distinguishedName"],
+                SearchScope::Subtree,
+            ) {
+                for user in user_results {
+                    let sam = user.get("samaccountname").cloned().unwrap_or_default();
+                    let dn = user.get("distinguishedname").cloned().unwrap_or_default();
+
+                    if !sam.is_empty() {
+                        user_tier_map
+                            .entry(sam.clone())
+                            .or_default()
+                            .insert(*tier);
+                        user_groups_map
+                            .entry(sam.clone())
+                            .or_default()
+                            .push(group_name.clone());
+                        user_dn_map
+                            .entry(sam)
+                            .or_insert(dn);
                     }
                 }
             }
@@ -96,14 +102,24 @@ pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, 
                 Tier::Tier2 => 2,
             });
 
+            // Deduplicate groups list
+            let mut groups = user_groups_map.get(&account_name).cloned().unwrap_or_default();
+            groups.sort();
+            groups.dedup();
+
             violations.push(CrossTierAccess {
                 account_name: account_name.clone(),
                 account_dn: user_dn_map.get(&account_name).cloned().unwrap_or_default(),
                 tiers: tier_vec,
-                groups: user_groups_map.get(&account_name).cloned().unwrap_or_default(),
+                groups,
             });
         }
     }
+
+    tracing::info!(
+        violation_count = violations.len(),
+        "Cross-tier access check completed"
+    );
 
     Ok(violations)
 }

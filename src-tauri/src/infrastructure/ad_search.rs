@@ -5,7 +5,13 @@
 use crate::domain::{ObjectType, Tier, Tier0RoleType, TierMember, Tier0Component};
 use crate::error::{AppError, AppResult};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use serde::Serialize;
+
+/// LDAP Matching Rule OID for transitive group membership (nested groups)
+/// This allows a single LDAP query to find all groups an object belongs to,
+/// including through nested group membership.
+pub const LDAP_MATCHING_RULE_IN_CHAIN: &str = "1.2.840.113556.1.4.1941";
 
 #[cfg(windows)]
 use windows::{
@@ -175,8 +181,10 @@ pub fn ldap_search(
         })?;
 
         let mut results = Vec::new();
-        const MAX_RESULTS: usize = 10000; // Safety limit to prevent infinite loops
-        const LOG_INTERVAL: usize = 500; // Log progress every N results
+        // Enterprise domains can have 100,000+ objects - set limit high enough
+        // The ADSI paging (set above with PAGESIZE=1000) handles the actual pagination
+        const MAX_RESULTS: usize = 500_000; // Safety limit for enterprise domains
+        const LOG_INTERVAL: usize = 5000; // Log progress every N results
 
         // Iterate through results with safety limits
         let mut row_count = 0;
@@ -186,7 +194,7 @@ pub fn ldap_search(
                 tracing::warn!(
                     base_dn = base_dn,
                     limit = MAX_RESULTS,
-                    "LDAP search hit result limit, stopping"
+                    "LDAP search hit result limit, stopping - this may indicate an issue"
                 );
                 break;
             }
@@ -200,12 +208,12 @@ pub fn ldap_search(
 
             row_count += 1;
 
-            // Log progress periodically
+            // Log progress periodically for large queries
             if row_count % LOG_INTERVAL == 0 {
                 tracing::info!(
                     base_dn = base_dn,
                     rows_processed = row_count,
-                    "LDAP search in progress..."
+                    "LDAP search in progress (large result set)..."
                 );
             }
 
@@ -236,6 +244,10 @@ pub fn ldap_search(
         Ok(results)
     }
 }
+
+/// Default range size for retrieving multi-valued attributes in AD
+/// AD's default MaxValRange is typically 1500
+const AD_RANGE_SIZE: usize = 1500;
 
 /// LDAP search scope
 #[derive(Debug, Clone, Copy)]
@@ -575,7 +587,7 @@ fn discover_fsmo_roles(domain_dn: &str) -> Vec<Tier0Component> {
                         let server_dn = format!("OU=Domain Controllers,{}", domain_dn);
                         if let Ok(server_results) = ldap_search(
                             &server_dn,
-                            &format!("(&(objectClass=computer)(name={}))", server_name),
+                            &format!("(&(objectClass=computer)(name={}))", escape_ldap_filter(&server_name)),
                             &["name", "distinguishedName", "operatingSystem", "lastLogonTimestamp", "description"],
                             SearchScope::OneLevel,
                         ) {
@@ -803,14 +815,563 @@ pub fn discover_tier0_infrastructure(domain_dn: &str) -> AppResult<Vec<Tier0Comp
     Ok(components)
 }
 
-/// Get group memberships for an AD object
+/// Get group memberships for an AD object (including nested/transitive memberships)
+///
+/// This function uses a hybrid approach for best performance and reliability:
+/// 1. Reads the `memberOf` attribute directly from the object (fast, direct memberships)
+/// 2. Uses LDAP_MATCHING_RULE_IN_CHAIN for transitive/nested group expansion (single query)
+/// 3. Resolves the primary group from `primaryGroupID` attribute
+/// 4. Batch fetches group details to avoid N+1 query patterns
 #[cfg(windows)]
 pub fn get_object_group_memberships(
     object_dn: &str,
 ) -> crate::error::AppResult<Vec<crate::commands::tier_management::GroupMembership>> {
-    // TODO: Implement actual group membership lookup
-    let _ = object_dn;
-    Ok(vec![])
+    let domain_dn = extract_domain_dn(object_dn);
+    let mut all_group_dns: HashSet<String> = HashSet::new();
+
+    tracing::debug!(object_dn = object_dn, "Getting group memberships for object");
+
+    // Step 1: Query object for memberOf and primaryGroupID attributes directly
+    let object_results = ldap_search(
+        object_dn,
+        "(objectClass=*)",
+        &["memberOf", "primaryGroupID"],
+        SearchScope::Base,
+    )?;
+
+    if let Some(result) = object_results.first() {
+        // Get direct memberOf values
+        if let Some(member_of_dns) = result.get_all("memberof") {
+            tracing::debug!(count = member_of_dns.len(), "Found direct memberOf entries");
+            for dn in member_of_dns {
+                all_group_dns.insert(dn.clone());
+            }
+        }
+
+        // Handle primary group (e.g., Domain Users)
+        if let Some(rid) = result.get("primarygroupid") {
+            tracing::debug!(rid = rid, "Found primaryGroupID, resolving primary group");
+            if let Some(pg_dn) = resolve_primary_group(&domain_dn, rid) {
+                tracing::debug!(primary_group_dn = %pg_dn, "Resolved primary group");
+                all_group_dns.insert(pg_dn);
+            }
+        }
+    }
+
+    // Step 2: Get transitive/nested memberships using LDAP_MATCHING_RULE_IN_CHAIN
+    // This single query finds ALL groups the object belongs to through any level of nesting
+    let filter = format!(
+        "(&(objectClass=group)(member:{}:={}))",
+        LDAP_MATCHING_RULE_IN_CHAIN,
+        escape_ldap_filter(object_dn)
+    );
+
+    tracing::debug!(filter = %filter, "Executing transitive group membership query");
+
+    match ldap_search(
+        &domain_dn,
+        &filter,
+        &["distinguishedName"],
+        SearchScope::Subtree,
+    ) {
+        Ok(nested_results) => {
+            tracing::debug!(count = nested_results.len(), "Found transitive group memberships");
+            for result in nested_results {
+                if let Some(dn) = result.get("distinguishedname") {
+                    all_group_dns.insert(dn.clone());
+                }
+            }
+        }
+        Err(e) => {
+            // Log but don't fail - we still have direct memberships
+            tracing::warn!(error = %e, "Failed to get transitive memberships, using direct memberships only");
+        }
+    }
+
+    tracing::info!(total_groups = all_group_dns.len(), "Total unique group memberships found");
+
+    // Step 3: Batch fetch group details
+    batch_get_group_details(&domain_dn, &all_group_dns)
+}
+
+/// Resolve primary group DN from a RID (Relative Identifier)
+///
+/// The primary group (e.g., "Domain Users") is not stored in memberOf but
+/// in the primaryGroupID attribute as a RID. This function resolves the
+/// RID to the full DN of the group.
+#[cfg(windows)]
+fn resolve_primary_group(domain_dn: &str, rid_str: &str) -> Option<String> {
+    let rid: u32 = match rid_str.parse() {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(rid = rid_str, "Failed to parse primaryGroupID as u32");
+            return None;
+        }
+    };
+
+    // Well-known RIDs - these are standard across all AD domains
+    let group_name = match rid {
+        512 => "Domain Admins",
+        513 => "Domain Users",
+        514 => "Domain Guests",
+        515 => "Domain Computers",
+        516 => "Domain Controllers",
+        517 => "Cert Publishers",
+        518 => "Schema Admins",
+        519 => "Enterprise Admins",
+        520 => "Group Policy Creator Owners",
+        521 => "Read-only Domain Controllers",
+        522 => "Cloneable Domain Controllers",
+        553 => "RAS and IAS Servers",
+        571 => "Allowed RODC Password Replication Group",
+        572 => "Denied RODC Password Replication Group",
+        _ => {
+            // For custom groups, search by primaryGroupToken attribute
+            tracing::debug!(rid = rid, "Searching for custom primary group by primaryGroupToken");
+            let filter = format!("(&(objectClass=group)(primaryGroupToken={}))", rid);
+            if let Ok(results) = ldap_search(domain_dn, &filter, &["distinguishedName"], SearchScope::Subtree) {
+                return results.first().and_then(|r| r.get("distinguishedname")).cloned();
+            }
+            return None;
+        }
+    };
+
+    // Search for well-known group by name
+    let filter = format!("(&(objectClass=group)(sAMAccountName={}))", escape_ldap_filter(group_name));
+    ldap_search(domain_dn, &filter, &["distinguishedName"], SearchScope::Subtree)
+        .ok()
+        .and_then(|r| r.first().and_then(|r| r.get("distinguishedname")).cloned())
+}
+
+/// Batch fetch group details from a set of group DNs
+///
+/// This reduces N+1 query patterns by fetching groups in batches
+/// using OR filters.
+
+/// Batch size for LDAP OR filter queries
+/// Larger batches are more efficient but may hit LDAP filter size limits
+const LDAP_BATCH_SIZE: usize = 100;
+
+#[cfg(windows)]
+fn batch_get_group_details(
+    domain_dn: &str,
+    group_dns: &HashSet<String>,
+) -> crate::error::AppResult<Vec<crate::commands::tier_management::GroupMembership>> {
+    use crate::commands::tier_management::GroupMembership;
+
+    if group_dns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut all_memberships = Vec::new();
+    let dns_vec: Vec<_> = group_dns.iter().collect();
+    let total_batches = (dns_vec.len() + LDAP_BATCH_SIZE - 1) / LDAP_BATCH_SIZE;
+
+    tracing::debug!(
+        total_groups = dns_vec.len(),
+        batch_size = LDAP_BATCH_SIZE,
+        total_batches = total_batches,
+        "Starting batch group details fetch"
+    );
+
+    // Process in batches to avoid LDAP filter size limits
+    for (batch_idx, chunk) in dns_vec.chunks(LDAP_BATCH_SIZE).enumerate() {
+        if batch_idx > 0 && batch_idx % 10 == 0 {
+            tracing::debug!(
+                batch = batch_idx,
+                total_batches = total_batches,
+                groups_fetched = all_memberships.len(),
+                "Batch progress..."
+            );
+        }
+
+        let filter_parts: Vec<String> = chunk
+            .iter()
+            .map(|dn| format!("(distinguishedName={})", escape_ldap_filter(dn)))
+            .collect();
+
+        let filter = format!("(&(objectClass=group)(|{}))", filter_parts.join(""));
+
+        match ldap_search(
+            domain_dn,
+            &filter,
+            &["name", "distinguishedName", "groupType"],
+            SearchScope::Subtree,
+        ) {
+            Ok(results) => {
+                for result in results {
+                    if let (Some(name), Some(dn)) = (result.get("name"), result.get("distinguishedname")) {
+                        let tier = determine_tier_from_group(dn, name);
+                        let group_type = parse_group_type_string(result.get("grouptype"));
+
+                        all_memberships.push(GroupMembership {
+                            group_name: name.clone(),
+                            group_dn: dn.clone(),
+                            tier,
+                            group_type,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    chunk_size = chunk.len(),
+                    batch = batch_idx,
+                    "Failed to fetch group batch, continuing"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        total_groups = all_memberships.len(),
+        "Completed batch group details fetch"
+    );
+
+    Ok(all_memberships)
+}
+
+/// Determine tier from group DN and name
+///
+/// Checks both the OU path and naming conventions to determine
+/// which tier a group belongs to.
+fn determine_tier_from_group(group_dn: &str, group_name: &str) -> Option<String> {
+    let dn_lower = group_dn.to_lowercase();
+    let name_lower = group_name.to_lowercase();
+
+    // Check OU path first (most reliable)
+    if dn_lower.contains("ou=tier0") || name_lower.starts_with("tier0-") {
+        Some("Tier0".to_string())
+    } else if dn_lower.contains("ou=tier1") || name_lower.starts_with("tier1-") {
+        Some("Tier1".to_string())
+    } else if dn_lower.contains("ou=tier2") || name_lower.starts_with("tier2-") {
+        Some("Tier2".to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse group type integer to human-readable string
+///
+/// The groupType attribute is a bitmask:
+/// - Bit 31 (sign bit): Security group if negative, Distribution if positive
+/// - Bits 0-3: Scope (2=Global, 4=Domain Local, 8=Universal)
+fn parse_group_type_string(group_type_str: Option<&String>) -> String {
+    let val: i32 = group_type_str.and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Security groups have negative groupType values (bit 31 set)
+    let is_security = val < 0;
+
+    // Scope is in lower bits
+    let scope = if (val.abs() & 0x2) != 0 {
+        "Global"
+    } else if (val.abs() & 0x4) != 0 {
+        "Domain Local"
+    } else if (val.abs() & 0x8) != 0 {
+        "Universal"
+    } else {
+        "Global" // Default
+    };
+
+    format!("{} {}", scope, if is_security { "Security" } else { "Distribution" })
+}
+
+/// Group member information
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMemberInfo {
+    pub name: String,
+    pub sam_account_name: String,
+    pub distinguished_name: String,
+    pub object_type: String,
+    pub enabled: bool,
+}
+
+/// Get members of a specific group
+///
+/// # Arguments
+/// * `group_dn` - The distinguished name of the group
+/// * `include_nested` - If true, includes members from nested groups (transitive)
+///
+/// When `include_nested` is true, uses LDAP_MATCHING_RULE_IN_CHAIN for a single
+/// efficient query that finds all transitive members.
+#[cfg(windows)]
+pub fn get_group_members(group_dn: &str, include_nested: bool) -> crate::error::AppResult<Vec<GroupMemberInfo>> {
+    let domain_dn = extract_domain_dn(group_dn);
+
+    tracing::debug!(group_dn = group_dn, include_nested = include_nested, "Getting group members");
+
+    if include_nested {
+        // Use LDAP_MATCHING_RULE_IN_CHAIN for transitive members
+        // This single query finds ALL objects that are members through any level of nesting
+        let filter = format!(
+            "(memberOf:{}:={})",
+            LDAP_MATCHING_RULE_IN_CHAIN,
+            escape_ldap_filter(group_dn)
+        );
+
+        tracing::debug!(filter = %filter, "Executing transitive member query");
+
+        let results = ldap_search(
+            &domain_dn,
+            &filter,
+            &["name", "sAMAccountName", "distinguishedName", "objectClass", "userAccountControl"],
+            SearchScope::Subtree,
+        )?;
+
+        tracing::debug!(count = results.len(), "Found transitive members");
+
+        Ok(results.iter().filter_map(parse_member_info).collect())
+    } else {
+        // Direct members only - read member attribute and batch fetch details
+        get_group_members_direct(group_dn, &domain_dn)
+    }
+}
+
+/// Get direct members of a group (no nested expansion)
+///
+/// Uses ranged retrieval for large groups (>1500 members) to handle
+/// AD's MaxValRange limit on multi-valued attributes.
+#[cfg(windows)]
+fn get_group_members_direct(group_dn: &str, domain_dn: &str) -> crate::error::AppResult<Vec<GroupMemberInfo>> {
+    // Get all member DNs using ranged retrieval for large groups
+    let member_dns = get_group_member_dns_with_range(group_dn)?;
+
+    if member_dns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    tracing::info!(
+        group_dn = group_dn,
+        member_count = member_dns.len(),
+        "Retrieved group member DNs, batch fetching details"
+    );
+
+    // Batch fetch member details to avoid N+1 queries
+    // Use larger batches (100) for enterprise efficiency
+    let mut members = Vec::new();
+    let total_batches = (member_dns.len() + 99) / 100;
+
+    for (batch_idx, chunk) in member_dns.chunks(100).enumerate() {
+        if batch_idx > 0 && batch_idx % 10 == 0 {
+            tracing::debug!(
+                batch = batch_idx,
+                total_batches = total_batches,
+                members_fetched = members.len(),
+                "Fetching member details..."
+            );
+        }
+
+        let filter_parts: Vec<String> = chunk
+            .iter()
+            .map(|dn| format!("(distinguishedName={})", escape_ldap_filter(dn)))
+            .collect();
+
+        let filter = format!("(|{})", filter_parts.join(""));
+
+        match ldap_search(
+            domain_dn,
+            &filter,
+            &["name", "sAMAccountName", "distinguishedName", "objectClass", "userAccountControl"],
+            SearchScope::Subtree,
+        ) {
+            Ok(results) => {
+                for result in &results {
+                    if let Some(member) = parse_member_info(result) {
+                        members.push(member);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    chunk_size = chunk.len(),
+                    batch = batch_idx,
+                    "Failed to fetch member batch, continuing"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        group_dn = group_dn,
+        total_members = members.len(),
+        "Completed fetching group member details"
+    );
+
+    Ok(members)
+}
+
+/// Get all member DNs from a group using ranged retrieval
+///
+/// Active Directory limits multi-valued attributes to MaxValRange (typically 1500).
+/// For groups with more members, we must use ranged retrieval:
+/// - First request: `member;range=0-1499`
+/// - Second request: `member;range=1500-2999`
+/// - Continue until AD returns `member;range=N-*` (asterisk indicates end)
+#[cfg(windows)]
+fn get_group_member_dns_with_range(group_dn: &str) -> crate::error::AppResult<Vec<String>> {
+    let mut all_members = Vec::new();
+    let mut range_start: usize = 0;
+    let range_size = AD_RANGE_SIZE;
+    let mut more_members = true;
+
+    tracing::debug!(group_dn = group_dn, "Starting ranged retrieval of group members");
+
+    while more_members {
+        let range_end = range_start + range_size - 1;
+        let range_attr = format!("member;range={}-{}", range_start, range_end);
+
+        // Try to get members in this range
+        let results = ldap_search(
+            group_dn,
+            "(objectClass=group)",
+            &[&range_attr],
+            SearchScope::Base,
+        )?;
+
+        if let Some(result) = results.first() {
+            // Check for members in the ranged attribute
+            // The returned attribute name may be "member;range=0-1499" or "member;range=0-*"
+            let mut found_members = false;
+
+            for (attr_name, values) in &result.attributes {
+                // Check if this is a member range attribute
+                if attr_name.starts_with("member;range=") || attr_name == "member" {
+                    if !values.is_empty() {
+                        found_members = true;
+                        all_members.extend(values.clone());
+
+                        // Check if this is the final range (contains "*")
+                        if attr_name.contains("-*") || attr_name == "member" {
+                            more_members = false;
+                        }
+
+                        tracing::debug!(
+                            range_attr = attr_name,
+                            count = values.len(),
+                            total = all_members.len(),
+                            "Retrieved member range"
+                        );
+                    }
+                    break;
+                }
+            }
+
+            // If no members found in this range, we're done
+            if !found_members {
+                // Try without range for small groups
+                if range_start == 0 {
+                    if let Some(members) = result.get_all("member") {
+                        all_members.extend(members.clone());
+                    }
+                }
+                more_members = false;
+            }
+        } else {
+            more_members = false;
+        }
+
+        range_start += range_size;
+
+        // Safety limit to prevent infinite loops
+        if range_start > 1_000_000 {
+            tracing::warn!(
+                group_dn = group_dn,
+                members_so_far = all_members.len(),
+                "Hit safety limit during ranged retrieval"
+            );
+            break;
+        }
+    }
+
+    // If ranged retrieval didn't work, try regular member attribute
+    if all_members.is_empty() {
+        let results = ldap_search(
+            group_dn,
+            "(objectClass=group)",
+            &["member"],
+            SearchScope::Base,
+        )?;
+
+        if let Some(result) = results.first() {
+            if let Some(members) = result.get_all("member") {
+                all_members.extend(members.clone());
+            }
+        }
+    }
+
+    tracing::info!(
+        group_dn = group_dn,
+        total_members = all_members.len(),
+        "Completed ranged retrieval of group members"
+    );
+
+    Ok(all_members)
+}
+
+/// Parse a search result into GroupMemberInfo
+fn parse_member_info(result: &SearchResult) -> Option<GroupMemberInfo> {
+    let name = result.get("name")?.clone();
+    let sam = result.get("samaccountname")?.clone();
+    let dn = result.get("distinguishedname")?.clone();
+
+    let object_classes = result.get_all("objectclass").cloned().unwrap_or_default();
+    let object_type = if object_classes.iter().any(|c| c.eq_ignore_ascii_case("computer")) {
+        "Computer"
+    } else if object_classes.iter().any(|c| c.eq_ignore_ascii_case("group")) {
+        "Group"
+    } else if object_classes.iter().any(|c| c.eq_ignore_ascii_case("user")) {
+        "User"
+    } else {
+        "Unknown"
+    }.to_string();
+
+    let uac: u32 = result.get("useraccountcontrol")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let enabled = (uac & 0x2) == 0;
+
+    Some(GroupMemberInfo {
+        name,
+        sam_account_name: sam,
+        distinguished_name: dn,
+        object_type,
+        enabled,
+    })
+}
+
+/// Escape special characters in LDAP filter values
+///
+/// Escapes characters that have special meaning in LDAP filters:
+/// * `\` → `\5c`
+/// * `*` → `\2a`
+/// * `(` → `\28`
+/// * `)` → `\29`
+/// * `\0` → `\00`
+pub fn escape_ldap_filter(value: &str) -> String {
+    value
+        .replace('\\', "\\5c")
+        .replace('*', "\\2a")
+        .replace('(', "\\28")
+        .replace(')', "\\29")
+        .replace('\0', "\\00")
+}
+
+/// Extract domain DN from an object DN
+fn extract_domain_dn(object_dn: &str) -> String {
+    // Find all DC= components and join them
+    let dc_parts: Vec<&str> = object_dn
+        .split(',')
+        .filter(|part| part.trim().to_uppercase().starts_with("DC="))
+        .collect();
+
+    if dc_parts.is_empty() {
+        object_dn.to_string()
+    } else {
+        dc_parts.join(",")
+    }
 }
 
 /// Test AD connection and return detailed diagnostics
