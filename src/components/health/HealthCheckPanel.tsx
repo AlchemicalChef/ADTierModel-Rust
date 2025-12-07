@@ -14,10 +14,10 @@ import {
 import {
   getDomainInfo,
   getTierCounts,
-  getComplianceStatus,
   getGpoStatus,
   checkTierInitialization,
 } from "../../services/tauri";
+import { useComplianceStatus } from "../../hooks/useTierData";
 import { useSettingsStore } from "../../store/settingsStore";
 import { notify } from "../../store/notificationStore";
 
@@ -136,12 +136,7 @@ export function HealthCheckPanel() {
   });
 
   // Compliance check
-  const complianceQuery = useQuery({
-    queryKey: ["healthCheck", "compliance"],
-    queryFn: getComplianceStatus,
-    staleTime: 60_000,
-    retry: 1,
-  });
+  const complianceQuery = useComplianceStatus();
 
   // GPO status check
   const gpoQuery = useQuery({

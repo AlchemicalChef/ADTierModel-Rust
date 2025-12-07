@@ -5,15 +5,11 @@
 use crate::domain::{
     ComplianceStatus, ComplianceViolation, CrossTierAccess, Tier, ViolationSeverity, ViolationType,
 };
-
-#[cfg(windows)]
 use crate::infrastructure::ad_connection::AdConnection;
-
-#[cfg(windows)]
 use crate::infrastructure::ad_search::{ldap_search, SearchScope, escape_ldap_filter};
 
 /// Get the domain DN for compliance checks
-#[cfg(windows)]
+
 pub fn get_domain_dn() -> Result<String, String> {
     let conn = AdConnection::connect().map_err(|e| format!("Failed to connect to AD: {:?}", e))?;
     Ok(conn.domain_dn.clone())
@@ -25,7 +21,7 @@ pub fn get_domain_dn() -> Result<String, String> {
 /// Uses LDAP_MATCHING_RULE_IN_CHAIN (1.2.840.113556.1.4.1941) for transitive
 /// group membership checking, which catches users who are members through
 /// nested groups.
-#[cfg(windows)]
+
 pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, String> {
     use std::collections::{HashMap, HashSet};
     use crate::infrastructure::ad_search::LDAP_MATCHING_RULE_IN_CHAIN;
@@ -125,7 +121,7 @@ pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, 
 }
 
 /// Check for stale accounts (not logged in for extended period)
-#[cfg(windows)]
+
 pub fn check_stale_accounts(domain_dn: &str, days_threshold: i64) -> Result<Vec<ComplianceViolation>, String> {
     let mut violations = Vec::new();
 
@@ -192,7 +188,7 @@ pub fn check_stale_accounts(domain_dn: &str, days_threshold: i64) -> Result<Vec<
 }
 
 /// Check for service accounts with interactive logon capability
-#[cfg(windows)]
+
 pub fn check_service_account_logon(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
     let mut violations = Vec::new();
 
@@ -245,136 +241,103 @@ pub fn check_service_account_logon(domain_dn: &str) -> Result<Vec<ComplianceViol
     Ok(violations)
 }
 
-/// Check objects in wrong tier OUs based on group membership
-#[cfg(windows)]
-pub fn check_wrong_tier_placement(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
+/// Helper function to check tier placement violations for a specific object type.
+/// This consolidates the duplicate logic for checking computers and users.
+
+fn check_object_type_tier_placement(
+    tier: &Tier,
+    tier_dn: &str,
+    ldap_filter: &str,
+    object_type_label: &str,
+) -> Vec<ComplianceViolation> {
     let mut violations = Vec::new();
 
-    // For each tier, check if objects have group memberships in other tiers
-    for tier in &[Tier::Tier0, Tier::Tier1, Tier::Tier2] {
-        let tier_dn = format!("{},{}", tier.ou_path(), domain_dn);
+    let results = ldap_search(
+        tier_dn,
+        ldap_filter,
+        &["name", "sAMAccountName", "distinguishedName", "memberOf"],
+        SearchScope::Subtree,
+    ).unwrap_or_default();
 
-        // Get all computers in this tier
-        let computer_results = ldap_search(
-            &tier_dn,
-            "(objectClass=computer)",
-            &["name", "sAMAccountName", "distinguishedName", "memberOf"],
-            SearchScope::Subtree,
-        ).unwrap_or_default();
+    for result in results {
+        let name = result.get("name").cloned().unwrap_or_default();
+        let sam = result.get("samaccountname").cloned().unwrap_or_default();
+        let dn = result.get("distinguishedname").cloned().unwrap_or_default();
 
-        for result in computer_results {
-            let name = result.get("name").cloned().unwrap_or_default();
-            let sam = result.get("samaccountname").cloned().unwrap_or_default();
-            let dn = result.get("distinguishedname").cloned().unwrap_or_default();
+        if let Some(memberships) = result.get_all("memberof") {
+            // Check if any group membership suggests a different tier
+            for group_dn in memberships {
+                // Use proper DN parsing instead of fragile substring matching
+                let implied_tier = Tier::from_dn(group_dn);
 
-            if let Some(memberships) = result.get_all("memberof") {
-                // Check if any group membership suggests a different tier
-                for group_dn in memberships {
-                    let group_dn_lower = group_dn.to_lowercase();
-
-                    // Detect wrong tier based on group location
-                    let implied_tier = if group_dn_lower.contains("ou=tier0") {
-                        Some(Tier::Tier0)
-                    } else if group_dn_lower.contains("ou=tier1") {
-                        Some(Tier::Tier1)
-                    } else if group_dn_lower.contains("ou=tier2") {
-                        Some(Tier::Tier2)
-                    } else {
-                        None
-                    };
-
-                    if let Some(implied) = implied_tier {
-                        if &implied != tier {
-                            // Object is in one tier but has group membership in another
-                            violations.push(ComplianceViolation {
-                                violation_type: ViolationType::WrongTierPlacement,
-                                severity: if *tier == Tier::Tier0 || implied == Tier::Tier0 {
-                                    ViolationSeverity::Critical
-                                } else {
-                                    ViolationSeverity::Medium
-                                },
-                                object_name: name.clone(),
-                                object_dn: dn.clone(),
-                                sam_account_name: sam.clone(),
-                                description: format!(
-                                    "Object is in {:?} but has group membership in {:?} group: {}",
-                                    tier, implied, group_dn
-                                ),
-                                tiers_involved: vec![*tier, implied],
-                                remediation: format!(
-                                    "Either move the object to {:?} or remove it from the {:?} group",
-                                    implied, implied
-                                ),
-                            });
-                            break; // One violation per object is enough
-                        }
-                    }
-                }
-            }
-        }
-
-        // Also check users
-        let user_results = ldap_search(
-            &tier_dn,
-            "(&(objectCategory=person)(objectClass=user))",
-            &["name", "sAMAccountName", "distinguishedName", "memberOf"],
-            SearchScope::Subtree,
-        ).unwrap_or_default();
-
-        for result in user_results {
-            let name = result.get("name").cloned().unwrap_or_default();
-            let sam = result.get("samaccountname").cloned().unwrap_or_default();
-            let dn = result.get("distinguishedname").cloned().unwrap_or_default();
-
-            if let Some(memberships) = result.get_all("memberof") {
-                for group_dn in memberships {
-                    let group_dn_lower = group_dn.to_lowercase();
-
-                    let implied_tier = if group_dn_lower.contains("ou=tier0") {
-                        Some(Tier::Tier0)
-                    } else if group_dn_lower.contains("ou=tier1") {
-                        Some(Tier::Tier1)
-                    } else if group_dn_lower.contains("ou=tier2") {
-                        Some(Tier::Tier2)
-                    } else {
-                        None
-                    };
-
-                    if let Some(implied) = implied_tier {
-                        if &implied != tier {
-                            violations.push(ComplianceViolation {
-                                violation_type: ViolationType::WrongTierPlacement,
-                                severity: if *tier == Tier::Tier0 || implied == Tier::Tier0 {
-                                    ViolationSeverity::Critical
-                                } else {
-                                    ViolationSeverity::Medium
-                                },
-                                object_name: name.clone(),
-                                object_dn: dn.clone(),
-                                sam_account_name: sam.clone(),
-                                description: format!(
-                                    "User is in {:?} but has group membership in {:?} group: {}",
-                                    tier, implied, group_dn
-                                ),
-                                tiers_involved: vec![*tier, implied],
-                                remediation: format!(
-                                    "Either move the user to {:?} or remove from the {:?} group",
-                                    implied, implied
-                                ),
-                            });
-                            break;
-                        }
+                if let Some(implied) = implied_tier {
+                    if &implied != tier {
+                        // Object is in one tier but has group membership in another
+                        violations.push(ComplianceViolation {
+                            violation_type: ViolationType::WrongTierPlacement,
+                            severity: if *tier == Tier::Tier0 || implied == Tier::Tier0 {
+                                ViolationSeverity::Critical
+                            } else {
+                                ViolationSeverity::Medium
+                            },
+                            object_name: name.clone(),
+                            object_dn: dn.clone(),
+                            sam_account_name: sam.clone(),
+                            description: format!(
+                                "{} is in {:?} but has group membership in {:?} group: {}",
+                                object_type_label, tier, implied, group_dn
+                            ),
+                            tiers_involved: vec![*tier, implied],
+                            remediation: format!(
+                                "Either move the {} to {:?} or remove it from the {:?} group",
+                                object_type_label.to_lowercase(), implied, implied
+                            ),
+                        });
+                        break; // One violation per object is enough
                     }
                 }
             }
         }
     }
 
+    violations
+}
+
+/// Check objects in wrong tier OUs based on group membership
+
+pub fn check_wrong_tier_placement(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
+    let mut violations = Vec::new();
+
+    // For each tier, check if objects have group memberships in other tiers
+    for tier in &[Tier::Tier0, Tier::Tier1, Tier::Tier2] {
+        let tier_dn = tier.full_ou_dn(domain_dn);
+
+        // Check computers
+        violations.extend(check_object_type_tier_placement(
+            tier,
+            &tier_dn,
+            "(objectClass=computer)",
+            "Computer",
+        ));
+
+        // Check users
+        violations.extend(check_object_type_tier_placement(
+            tier,
+            &tier_dn,
+            "(&(objectCategory=person)(objectClass=user))",
+            "User",
+        ));
+    }
+
     Ok(violations)
 }
 
 /// Get full compliance status
-pub fn get_compliance_status(domain_dn: &str) -> Result<ComplianceStatus, String> {
+///
+/// # Arguments
+/// * `domain_dn` - The domain distinguished name
+/// * `stale_threshold_days` - Number of days without logon to consider an account stale
+pub fn get_compliance_status(domain_dn: &str, stale_threshold_days: u32) -> Result<ComplianceStatus, String> {
     let mut status = ComplianceStatus::new();
 
     // Check cross-tier access
@@ -403,8 +366,8 @@ pub fn get_compliance_status(domain_dn: &str) -> Result<ComplianceStatus, String
         status.add_cross_tier_access(access.clone());
     }
 
-    // Check stale accounts (90 days threshold)
-    let stale = check_stale_accounts(domain_dn, 90)?;
+    // Check stale accounts using configurable threshold
+    let stale = check_stale_accounts(domain_dn, stale_threshold_days)?;
     for violation in stale {
         status.add_violation(violation);
     }

@@ -5,7 +5,7 @@
 
 use crate::domain::Tier;
 use crate::error::AppResult;
-#[cfg(windows)]
+
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 
@@ -70,7 +70,7 @@ impl GpoConfigResult {
 }
 
 /// Get the GPO status for all tiers
-#[cfg(windows)]
+
 pub fn get_all_gpo_status(domain_dn: &str) -> AppResult<Vec<TierGpoStatus>> {
     use std::process::Command;
 
@@ -307,7 +307,7 @@ fn get_deny_groups_for_tier(tier: Tier, logon_type: &str) -> Vec<String> {
 }
 
 /// Create and configure GPOs for a specific tier
-#[cfg(windows)]
+
 pub fn configure_tier_gpos(tier: Tier, domain_dn: &str) -> AppResult<GpoConfigResult> {
     use std::process::Command;
 
@@ -733,7 +733,7 @@ pub fn configure_all_tier_gpos(domain_dn: &str) -> AppResult<GpoConfigResult> {
 }
 
 /// Delete GPOs for a tier (for cleanup/reset)
-#[cfg(windows)]
+
 pub fn delete_tier_gpos(tier: Tier, _domain_dn: &str) -> AppResult<Vec<String>> {
     use std::process::Command;
 

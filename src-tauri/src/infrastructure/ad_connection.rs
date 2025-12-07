@@ -5,19 +5,16 @@
 
 use crate::domain::DomainInfo;
 use crate::error::{AppError, AppResult};
-
-#[cfg(windows)]
+use super::ensure_com_initialized;
 use windows::{
     core::{BSTR, Interface, PCWSTR},
     Win32::Foundation::SysStringLen,
     Win32::Networking::ActiveDirectory::*,
-    Win32::System::Com::*,
+    Win32::System::Com::CoUninitialize,
     Win32::System::Variant::*,
 };
-
-#[cfg(windows)]
 use std::ffi::OsString;
-#[cfg(windows)]
+
 use std::os::windows::ffi::OsStringExt;
 
 /// Active Directory connection handle
@@ -25,19 +22,19 @@ pub struct AdConnection {
     pub domain_dn: String,
     pub dns_root: String,
     pub netbios_name: String,
-    #[cfg(windows)]
+
     _com_initialized: bool,
 }
 
 impl AdConnection {
     /// Connect to Active Directory using current Windows credentials
-    #[cfg(windows)]
+
     pub fn connect() -> AppResult<Self> {
         tracing::info!("Attempting to connect to Active Directory");
         unsafe {
-            // Initialize COM
+            // Initialize COM using centralized helper
             tracing::debug!("Initializing COM");
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            ensure_com_initialized()?;
 
             // Connect to RootDSE to get domain info
             tracing::debug!("Connecting to RootDSE");
@@ -93,7 +90,7 @@ impl AdConnection {
     }
 
     /// Get a property from an IADs object
-    #[cfg(windows)]
+
     unsafe fn get_ads_property(ads: &IADs, property: &str) -> AppResult<String> {
         tracing::debug!("Getting AD property: {}", property);
         let prop_name = BSTR::from(property);
@@ -107,7 +104,7 @@ impl AdConnection {
     }
 
     /// Convert VARIANT to String
-    #[cfg(windows)]
+
     unsafe fn variant_to_string(var: &VARIANT) -> AppResult<String> {
         let vt = var.Anonymous.Anonymous.vt;
 
@@ -141,7 +138,7 @@ impl AdConnection {
     }
 
     /// Get NetBIOS name from AD configuration
-    #[cfg(windows)]
+
     unsafe fn get_netbios_name(domain_dn: &str) -> AppResult<String> {
         tracing::debug!("Querying NetBIOS name from configuration partition");
         // Query the Partitions container in the Configuration NC
@@ -171,7 +168,11 @@ impl AdConnection {
         })?;
 
         // Search for the partition with matching nCName
-        let filter = BSTR::from(format!("(&(objectClass=crossRef)(nCName={}))", domain_dn).as_str());
+        // Escape domain_dn to prevent LDAP filter injection
+        let filter = BSTR::from(format!(
+            "(&(objectClass=crossRef)(nCName={}))",
+            super::ad_search::escape_ldap_filter(domain_dn)
+        ).as_str());
         // Keep BSTR alive for the duration of the search
         let attr_name_bstr = BSTR::from("nETBIOSName");
         let attrs: [PCWSTR; 1] = [PCWSTR(attr_name_bstr.as_ptr())];
@@ -227,8 +228,6 @@ impl AdConnection {
         }
     }
 }
-
-#[cfg(windows)]
 impl Drop for AdConnection {
     fn drop(&mut self) {
         if self._com_initialized {

@@ -22,8 +22,8 @@ import {
   ChevronDownIcon,
   ChevronUpIcon,
 } from "@heroicons/react/24/outline";
-import type { TierMember, Tier0RoleType, TierLevel } from "../../types/tier";
-import { tierConfig } from "../../types/tier";
+import type { TierMember, TierLevel } from "../../types/tier";
+import { tierConfig, getRoleLabel } from "../../types/tier";
 import { MoveObjectModal } from "./MoveObjectModal";
 import { GroupMembershipModal } from "./GroupMembershipModal";
 import { getObjectGroups, getGroupMembers } from "../../services/tauri";
@@ -62,21 +62,6 @@ function getObjectIcon(member: TierMember) {
       return UserGroupIcon;
     default:
       return ComputerDesktopIcon;
-  }
-}
-
-function getRoleLabel(roleType: Tier0RoleType): string {
-  switch (roleType) {
-    case "DomainController":
-      return "Domain Controller";
-    case "ADFS":
-      return "AD FS";
-    case "EntraConnect":
-      return "Entra Connect";
-    case "CertificateAuthority":
-      return "Certificate Authority";
-    case "PAW":
-      return "Privileged Access Workstation";
   }
 }
 

@@ -23,6 +23,8 @@ interface NotificationState {
 }
 
 let notificationId = 0;
+// Track active timeouts to allow cleanup
+const activeTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
 export const useNotificationStore = create<NotificationState>((set) => ({
   notifications: [],
@@ -42,23 +44,34 @@ export const useNotificationStore = create<NotificationState>((set) => ({
 
     // Auto-remove after duration (if not permanent)
     if (newNotification.duration && newNotification.duration > 0) {
-      setTimeout(() => {
+      const timeoutId = setTimeout(() => {
+        activeTimeouts.delete(id);
         set((state) => ({
           notifications: state.notifications.filter((n) => n.id !== id),
         }));
       }, newNotification.duration);
+      activeTimeouts.set(id, timeoutId);
     }
 
     return id;
   },
 
   removeNotification: (id) => {
+    // Clear any pending timeout for this notification
+    const timeoutId = activeTimeouts.get(id);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      activeTimeouts.delete(id);
+    }
     set((state) => ({
       notifications: state.notifications.filter((n) => n.id !== id),
     }));
   },
 
   clearAll: () => {
+    // Clear all pending timeouts
+    activeTimeouts.forEach((timeoutId) => clearTimeout(timeoutId));
+    activeTimeouts.clear();
     set({ notifications: [] });
   },
 }));

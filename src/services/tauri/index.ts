@@ -43,7 +43,8 @@ export async function getTierMembers(tierName: TierLevel | "Unassigned"): Promis
 // Get Tier 0 infrastructure
 export interface Tier0Component {
   name: string;
-  roleType: "DomainController" | "ADFS" | "EntraConnect" | "CertificateAuthority" | "PAW";
+  roleType: "DomainController" | "ADFS" | "EntraConnect" | "CertificateAuthority" | "PAW"
+          | "SchemaMaster" | "DomainNamingMaster" | "RIDMaster" | "PDCEmulator" | "InfrastructureMaster";
   operatingSystem: string | null;
   lastLogon: string | null;
   currentOu: string;
@@ -157,8 +158,8 @@ export interface ComplianceStatus {
 }
 
 // Compliance commands
-export async function getComplianceStatus(): Promise<ComplianceStatus> {
-  return tauriCommand("get_compliance_status");
+export async function getComplianceStatus(staleThresholdDays?: number): Promise<ComplianceStatus> {
+  return tauriCommand("get_compliance_status", { staleThresholdDays });
 }
 
 export async function getCrossTierViolations(): Promise<CrossTierAccess[]> {
@@ -222,10 +223,13 @@ export async function createAdminAccount(
 
 // GPO Management types
 export interface GpoStatus {
-  exists: boolean;
   name: string;
+  exists: boolean;
   linked: boolean;
-  linkPath: string | null;
+  linkEnabled: boolean;
+  targetOu: string;
+  created: string | null;
+  modified: string | null;
 }
 
 export interface TierGpoStatus {
@@ -241,9 +245,10 @@ export interface TierGpoStatus {
 export interface GpoConfigResult {
   success: boolean;
   gposCreated: string[];
+  gposConfigured: string[];
   gposLinked: string[];
-  restrictionsApplied: boolean;
   errors: string[];
+  warnings: string[];
 }
 
 // GPO Management commands
@@ -273,7 +278,7 @@ export interface BulkDisableResult {
 
 // Bulk disable stale accounts
 export async function bulkDisableStaleAccounts(objectDns: string[]): Promise<BulkDisableResult> {
-  return tauriCommand("bulk_disable_stale_accounts", { objectDns });
+  return tauriCommand("bulk_disable_stale_accounts", { object_dns: objectDns });
 }
 
 // Service account hardening types
@@ -286,7 +291,7 @@ export interface HardenAccountsResult {
 
 // Harden service accounts (mark as sensitive, cannot be delegated)
 export async function hardenServiceAccounts(objectDns: string[]): Promise<HardenAccountsResult> {
-  return tauriCommand("harden_service_accounts", { objectDns });
+  return tauriCommand("harden_service_accounts", { object_dns: objectDns });
 }
 
 // Endpoint Protection GPO types

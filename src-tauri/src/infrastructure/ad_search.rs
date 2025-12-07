@@ -12,17 +12,14 @@ use serde::Serialize;
 /// This allows a single LDAP query to find all groups an object belongs to,
 /// including through nested group membership.
 pub const LDAP_MATCHING_RULE_IN_CHAIN: &str = "1.2.840.113556.1.4.1941";
-
-#[cfg(windows)]
+use super::ensure_com_initialized;
 use windows::{
     core::{BSTR, Interface, PCWSTR},
     Win32::Networking::ActiveDirectory::*,
     Win32::System::Com::*,
 };
-
-#[cfg(windows)]
 use std::ffi::OsString;
-#[cfg(windows)]
+
 use std::os::windows::ffi::OsStringExt;
 
 /// Diagnostic information for AD connection issues
@@ -72,7 +69,7 @@ impl SearchResult {
 }
 
 /// Perform an LDAP search
-#[cfg(windows)]
+
 pub fn ldap_search(
     base_dn: &str,
     filter: &str,
@@ -86,21 +83,8 @@ pub fn ldap_search(
         "LDAP SEARCH: Starting query"
     );
     unsafe {
-        // Initialize COM - use MULTITHREADED for async compatibility
-        // Handle the case where COM is already initialized
-        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let hr_code = hr.0 as u32;
-        if hr.is_ok() {
-            tracing::trace!("COM initialized successfully");
-        } else if hr_code == 0x00000001 {
-            // S_FALSE means COM was already initialized, which is fine
-            tracing::trace!("COM was already initialized");
-        } else if hr_code == 0x80010106 {
-            // RPC_E_CHANGED_MODE means it was initialized with different mode
-            tracing::debug!("COM initialized with different threading model, continuing anyway");
-        } else {
-            tracing::warn!(hresult = format!("0x{:08X}", hr_code), "COM initialization returned unexpected result");
-        }
+        // Initialize COM - use APARTMENTTHREADED for ADSI compatibility
+        ensure_com_initialized()?;
 
         let ldap_path = format!("LDAP://{}", base_dn);
         tracing::debug!(ldap_path = %ldap_path, "Opening LDAP connection");
@@ -258,7 +242,7 @@ pub enum SearchScope {
 }
 
 impl SearchScope {
-    #[cfg(windows)]
+
     fn to_ads_scope(&self) -> i32 {
         match self {
             SearchScope::Base => ADS_SCOPE_BASE.0,
@@ -269,7 +253,7 @@ impl SearchScope {
 }
 
 /// Extract values from an ADS_SEARCH_COLUMN
-#[cfg(windows)]
+
 unsafe fn extract_column_values(column: &ADS_SEARCH_COLUMN) -> Vec<String> {
     let mut values = Vec::new();
 
@@ -289,7 +273,7 @@ unsafe fn extract_column_values(column: &ADS_SEARCH_COLUMN) -> Vec<String> {
 }
 
 /// Extract a string from an ADSVALUE
-#[cfg(windows)]
+
 unsafe fn extract_adsvalue(value: &ADSVALUE) -> Option<String> {
     match value.dwType {
         ADSTYPE_DN_STRING | ADSTYPE_CASE_EXACT_STRING | ADSTYPE_CASE_IGNORE_STRING
@@ -822,7 +806,7 @@ pub fn discover_tier0_infrastructure(domain_dn: &str) -> AppResult<Vec<Tier0Comp
 /// 2. Uses LDAP_MATCHING_RULE_IN_CHAIN for transitive/nested group expansion (single query)
 /// 3. Resolves the primary group from `primaryGroupID` attribute
 /// 4. Batch fetches group details to avoid N+1 query patterns
-#[cfg(windows)]
+
 pub fn get_object_group_memberships(
     object_dn: &str,
 ) -> crate::error::AppResult<Vec<crate::commands::tier_management::GroupMembership>> {
@@ -899,7 +883,7 @@ pub fn get_object_group_memberships(
 /// The primary group (e.g., "Domain Users") is not stored in memberOf but
 /// in the primaryGroupID attribute as a RID. This function resolves the
 /// RID to the full DN of the group.
-#[cfg(windows)]
+
 fn resolve_primary_group(domain_dn: &str, rid_str: &str) -> Option<String> {
     let rid: u32 = match rid_str.parse() {
         Ok(r) => r,
@@ -951,8 +935,6 @@ fn resolve_primary_group(domain_dn: &str, rid_str: &str) -> Option<String> {
 /// Batch size for LDAP OR filter queries
 /// Larger batches are more efficient but may hit LDAP filter size limits
 const LDAP_BATCH_SIZE: usize = 100;
-
-#[cfg(windows)]
 fn batch_get_group_details(
     domain_dn: &str,
     group_dns: &HashSet<String>,
@@ -1096,7 +1078,7 @@ pub struct GroupMemberInfo {
 ///
 /// When `include_nested` is true, uses LDAP_MATCHING_RULE_IN_CHAIN for a single
 /// efficient query that finds all transitive members.
-#[cfg(windows)]
+
 pub fn get_group_members(group_dn: &str, include_nested: bool) -> crate::error::AppResult<Vec<GroupMemberInfo>> {
     let domain_dn = extract_domain_dn(group_dn);
 
@@ -1133,7 +1115,7 @@ pub fn get_group_members(group_dn: &str, include_nested: bool) -> crate::error::
 ///
 /// Uses ranged retrieval for large groups (>1500 members) to handle
 /// AD's MaxValRange limit on multi-valued attributes.
-#[cfg(windows)]
+
 fn get_group_members_direct(group_dn: &str, domain_dn: &str) -> crate::error::AppResult<Vec<GroupMemberInfo>> {
     // Get all member DNs using ranged retrieval for large groups
     let member_dns = get_group_member_dns_with_range(group_dn)?;
@@ -1210,7 +1192,7 @@ fn get_group_members_direct(group_dn: &str, domain_dn: &str) -> crate::error::Ap
 /// - First request: `member;range=0-1499`
 /// - Second request: `member;range=1500-2999`
 /// - Continue until AD returns `member;range=N-*` (asterisk indicates end)
-#[cfg(windows)]
+
 fn get_group_member_dns_with_range(group_dn: &str) -> crate::error::AppResult<Vec<String>> {
     let mut all_members = Vec::new();
     let mut range_start: usize = 0;
@@ -1375,7 +1357,7 @@ fn extract_domain_dn(object_dn: &str) -> String {
 }
 
 /// Test AD connection and return detailed diagnostics
-#[cfg(windows)]
+
 pub fn test_ad_connection(domain_dn: &str) -> AdDiagnostics {
     use crate::domain::Tier;
 
@@ -1394,7 +1376,7 @@ pub fn test_ad_connection(domain_dn: &str) -> AdDiagnostics {
     unsafe {
         // Step 1: Initialize COM
         diagnostics.steps_completed.push("Attempting COM initialization...".to_string());
-        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let hr_code = hr.0 as u32;
 
         if hr.is_ok() {
@@ -1625,20 +1607,4 @@ pub fn test_ad_connection(domain_dn: &str) -> AdDiagnostics {
     diagnostics.steps_completed.push("Tier OU tests completed".to_string());
 
     diagnostics
-}
-
-/// Test AD connection (non-Windows stub)
-#[cfg(not(windows))]
-pub fn test_ad_connection(domain_dn: &str) -> AdDiagnostics {
-    AdDiagnostics {
-        domain_dn: domain_dn.to_string(),
-        com_init_status: "N/A (not Windows)".to_string(),
-        ldap_bind_status: "N/A (not Windows)".to_string(),
-        ldap_search_status: "N/A (not Windows)".to_string(),
-        objects_found: 0,
-        error_code: None,
-        error_message: Some("AD diagnostics only available on Windows".to_string()),
-        steps_completed: vec!["Running on non-Windows platform".to_string()],
-        tier_ou_status: Vec::new(),
-    }
 }

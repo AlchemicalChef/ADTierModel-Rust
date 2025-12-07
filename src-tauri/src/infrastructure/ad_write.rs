@@ -7,10 +7,9 @@ use crate::domain::{
     SubOU, Tier, sub_ou_dn, tier_group_dn, tier_group_name, tier_ou_dn,
 };
 use crate::error::AppResult;
-#[cfg(windows)]
-use crate::error::AppError;
 
-#[cfg(windows)]
+use crate::error::AppError;
+use super::open_ad_object;
 use windows::{
     core::{BSTR, Interface, PCWSTR},
     Win32::Networking::ActiveDirectory::*,
@@ -18,58 +17,34 @@ use windows::{
     Win32::System::Variant::*,
 };
 
+/// Escape a string for safe use in PowerShell single-quoted strings.
+/// Single quotes in PowerShell are escaped by doubling them: ' -> ''
+fn escape_powershell_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Check if an OU exists
-#[cfg(windows)]
+
 pub fn ou_exists(ou_dn: &str) -> AppResult<bool> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-        let ldap_path = format!("LDAP://{}", ou_dn);
-        let path_bstr = BSTR::from(ldap_path.as_str());
-
-        let mut obj: Option<IADs> = None;
-        let result = ADsOpenObject(
-            PCWSTR(path_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADs as Interface>::IID,
-            &mut obj as *mut _ as *mut *mut std::ffi::c_void,
-        );
-
-        Ok(result.is_ok() && obj.is_some())
+    // Try to open the object - if it fails, it doesn't exist
+    match open_ad_object::<IADs>(ou_dn) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
     }
 }
 
 /// Check if a group exists
+
 pub fn group_exists(group_dn: &str) -> AppResult<bool> {
     ou_exists(group_dn) // Same check works for groups
 }
 
 /// Create an Organizational Unit
-#[cfg(windows)]
+
 pub fn create_ou(parent_dn: &str, ou_name: &str, description: Option<&str>) -> AppResult<String> {
     tracing::info!(ou_name = ou_name, parent_dn = parent_dn, "Creating organizational unit");
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-        let ldap_path = format!("LDAP://{}", parent_dn);
-        let path_bstr = BSTR::from(ldap_path.as_str());
-
-        let mut container: Option<IADsContainer> = None;
-        ADsOpenObject(
-            PCWSTR(path_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADsContainer as Interface>::IID,
-            &mut container as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| AppError::LdapError(format!("Failed to open container {}: {}", parent_dn, e)))?;
-
-        let container = container.ok_or_else(|| {
-            AppError::LdapError(format!("Container interface not available for {}", parent_dn))
-        })?;
+        let container: IADsContainer = open_ad_object(parent_dn)?;
 
         // Create the OU
         let class_name = BSTR::from("organizationalUnit");
@@ -109,7 +84,7 @@ pub fn create_ou(parent_dn: &str, ou_name: &str, description: Option<&str>) -> A
 }
 
 /// Create a security group
-#[cfg(windows)]
+
 pub fn create_security_group(
     parent_dn: &str,
     group_name: &str,
@@ -123,25 +98,7 @@ pub fn create_security_group(
         "Creating security group"
     );
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-        let ldap_path = format!("LDAP://{}", parent_dn);
-        let path_bstr = BSTR::from(ldap_path.as_str());
-
-        let mut container: Option<IADsContainer> = None;
-        ADsOpenObject(
-            PCWSTR(path_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADsContainer as Interface>::IID,
-            &mut container as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| AppError::LdapError(format!("Failed to open container {}: {}", parent_dn, e)))?;
-
-        let container = container.ok_or_else(|| {
-            AppError::LdapError(format!("Container interface not available for {}", parent_dn))
-        })?;
+        let container: IADsContainer = open_ad_object(parent_dn)?;
 
         // Create the group
         let class_name = BSTR::from("group");
@@ -208,7 +165,7 @@ pub enum GroupScope {
 }
 
 /// Move an AD object to a different OU
-#[cfg(windows)]
+
 pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> {
     tracing::info!(
         object_dn = object_dn,
@@ -216,50 +173,11 @@ pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> 
         "Moving AD object"
     );
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
         // Open the object to move
-        let object_path = format!("LDAP://{}", object_dn);
-        let object_bstr = BSTR::from(object_path.as_str());
-
-        let mut obj: Option<IADs> = None;
-        ADsOpenObject(
-            PCWSTR(object_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADs as Interface>::IID,
-            &mut obj as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| AppError::LdapError(format!("Failed to open object {}: {}", object_dn, e)))?;
-
-        let obj = obj.ok_or_else(|| {
-            AppError::LdapError(format!("Object interface not available for {}", object_dn))
-        })?;
+        let obj: IADs = open_ad_object(object_dn)?;
 
         // Open the target container
-        let target_path = format!("LDAP://{}", target_ou_dn);
-        let target_bstr = BSTR::from(target_path.as_str());
-
-        let mut target_container: Option<IADsContainer> = None;
-        ADsOpenObject(
-            PCWSTR(target_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADsContainer as Interface>::IID,
-            &mut target_container as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| {
-            AppError::LdapError(format!("Failed to open target OU {}: {}", target_ou_dn, e))
-        })?;
-
-        let target_container = target_container.ok_or_else(|| {
-            AppError::LdapError(format!(
-                "Container interface not available for {}",
-                target_ou_dn
-            ))
-        })?;
+        let target_container: IADsContainer = open_ad_object(target_ou_dn)?;
 
         // Move the object using MoveHere
         let ads_path = obj.ADsPath().map_err(|e| {
@@ -295,7 +213,7 @@ pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> 
 }
 
 /// Add a member to a group
-#[cfg(windows)]
+
 pub fn add_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
     tracing::info!(
         group_dn = group_dn,
@@ -303,25 +221,7 @@ pub fn add_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
         "Adding member to group"
     );
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-        let group_path = format!("LDAP://{}", group_dn);
-        let group_bstr = BSTR::from(group_path.as_str());
-
-        let mut group: Option<IADsGroup> = None;
-        ADsOpenObject(
-            PCWSTR(group_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADsGroup as Interface>::IID,
-            &mut group as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| AppError::LdapError(format!("Failed to open group {}: {}", group_dn, e)))?;
-
-        let group = group.ok_or_else(|| {
-            AppError::LdapError(format!("Group interface not available for {}", group_dn))
-        })?;
+        let group: IADsGroup = open_ad_object(group_dn)?;
 
         // Add the member using LDAP path
         let member_path = format!("LDAP://{}", member_dn);
@@ -345,7 +245,7 @@ pub fn add_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
 }
 
 /// Create a tiered admin user account
-#[cfg(windows)]
+
 pub fn create_admin_user(
     parent_dn: &str,
     sam_account_name: &str,
@@ -355,25 +255,7 @@ pub fn create_admin_user(
     enabled: bool,
 ) -> AppResult<String> {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-        let ldap_path = format!("LDAP://{}", parent_dn);
-        let path_bstr = BSTR::from(ldap_path.as_str());
-
-        let mut container: Option<IADsContainer> = None;
-        ADsOpenObject(
-            PCWSTR(path_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADsContainer as Interface>::IID,
-            &mut container as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| AppError::LdapError(format!("Failed to open container {}: {}", parent_dn, e)))?;
-
-        let container = container.ok_or_else(|| {
-            AppError::LdapError(format!("Container interface not available for {}", parent_dn))
-        })?;
+        let container: IADsContainer = open_ad_object(parent_dn)?;
 
         // Create the user object
         let class_name = BSTR::from("user");
@@ -460,7 +342,7 @@ pub fn create_admin_user(
 }
 
 /// Remove a member from a group
-#[cfg(windows)]
+
 pub fn remove_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
     tracing::info!(
         group_dn = group_dn,
@@ -468,25 +350,7 @@ pub fn remove_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
         "Removing member from group"
     );
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-        let group_path = format!("LDAP://{}", group_dn);
-        let group_bstr = BSTR::from(group_path.as_str());
-
-        let mut group: Option<IADsGroup> = None;
-        ADsOpenObject(
-            PCWSTR(group_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADsGroup as Interface>::IID,
-            &mut group as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| AppError::LdapError(format!("Failed to open group {}: {}", group_dn, e)))?;
-
-        let group = group.ok_or_else(|| {
-            AppError::LdapError(format!("Group interface not available for {}", group_dn))
-        })?;
+        let group: IADsGroup = open_ad_object(group_dn)?;
 
         // Remove the member using LDAP path
         let member_path = format!("LDAP://{}", member_dn);
@@ -510,7 +374,7 @@ pub fn remove_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
 }
 
 /// Create a VARIANT containing a BSTR
-#[cfg(windows)]
+
 unsafe fn create_bstr_variant(s: &str) -> VARIANT {
     use windows::Win32::System::Variant::VariantInit;
     let bstr = BSTR::from(s);
@@ -524,7 +388,7 @@ unsafe fn create_bstr_variant(s: &str) -> VARIANT {
 }
 
 /// Create a VARIANT containing an i4 (32-bit integer)
-#[cfg(windows)]
+
 unsafe fn create_i4_variant(val: i32) -> VARIANT {
     use windows::Win32::System::Variant::VariantInit;
     let mut var: VARIANT = VariantInit();
@@ -616,7 +480,7 @@ impl AceFlags {
 }
 
 /// Set permissions on an OU using ADSI
-#[cfg(windows)]
+
 pub fn set_ou_permissions(
     ou_dn: &str,
     trustee: &str, // sAMAccountName or DN of group/user
@@ -625,26 +489,8 @@ pub fn set_ou_permissions(
     flags: AceFlags,
 ) -> AppResult<()> {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
         // Open the OU
-        let ldap_path = format!("LDAP://{}", ou_dn);
-        let path_bstr = BSTR::from(ldap_path.as_str());
-
-        let mut obj: Option<IADs> = None;
-        ADsOpenObject(
-            PCWSTR(path_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADs as Interface>::IID,
-            &mut obj as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| AppError::LdapError(format!("Failed to open OU {}: {}", ou_dn, e)))?;
-
-        let obj = obj.ok_or_else(|| {
-            AppError::LdapError(format!("Object interface not available for {}", ou_dn))
-        })?;
+        let obj: IADs = open_ad_object(ou_dn)?;
 
         // Get the security descriptor
         let sd_prop = BSTR::from("ntSecurityDescriptor");
@@ -736,7 +582,7 @@ pub fn set_ou_permissions(
 }
 
 /// Protect an OU from accidental deletion
-#[cfg(windows)]
+
 pub fn protect_ou_from_deletion(ou_dn: &str) -> AppResult<()> {
     // Deny Delete and DeleteTree to Everyone
     set_ou_permissions(
@@ -801,7 +647,7 @@ impl TierGpoConfig {
 /// 1. The GroupPolicy PowerShell module provides reliable GPO management
 /// 2. Direct COM access to GPMC is complex and brittle
 /// 3. The ADTierModel.psm1 module provides tested functions
-#[cfg(windows)]
+
 pub fn create_tier_gpos(domain_dn: &str) -> AppResult<Vec<String>> {
     use std::process::Command;
 
@@ -812,6 +658,12 @@ pub fn create_tier_gpos(domain_dn: &str) -> AppResult<Vec<String>> {
         let config = TierGpoConfig::for_tier(*tier, domain_dn);
 
         // PowerShell command to create base GPO
+        // Escape all interpolated values to prevent PowerShell injection
+        let base_name = escape_powershell_string(&config.base_policy_name);
+        let logon_name = escape_powershell_string(&config.logon_restrictions_name);
+        let tier_str = escape_powershell_string(&tier.to_string());
+        let target = escape_powershell_string(&config.target_ou);
+
         let ps_script = format!(
             r#"
             Import-Module GroupPolicy -ErrorAction Stop
@@ -819,7 +671,7 @@ pub fn create_tier_gpos(domain_dn: &str) -> AppResult<Vec<String>> {
             # Create base policy GPO if it doesn't exist
             $baseGpo = Get-GPO -Name '{base_name}' -ErrorAction SilentlyContinue
             if (-not $baseGpo) {{
-                $baseGpo = New-GPO -Name '{base_name}' -Comment 'Base security policy for {tier}'
+                $baseGpo = New-GPO -Name '{base_name}' -Comment 'Base security policy for {tier_str}'
                 New-GPLink -Name '{base_name}' -Target '{target}' -LinkEnabled Yes -ErrorAction SilentlyContinue
                 Write-Output "Created:{base_name}"
             }}
@@ -827,15 +679,11 @@ pub fn create_tier_gpos(domain_dn: &str) -> AppResult<Vec<String>> {
             # Create logon restrictions GPO if it doesn't exist
             $logonGpo = Get-GPO -Name '{logon_name}' -ErrorAction SilentlyContinue
             if (-not $logonGpo) {{
-                $logonGpo = New-GPO -Name '{logon_name}' -Comment 'Logon restrictions for {tier}'
+                $logonGpo = New-GPO -Name '{logon_name}' -Comment 'Logon restrictions for {tier_str}'
                 New-GPLink -Name '{logon_name}' -Target '{target}' -LinkEnabled Yes -Order 1 -ErrorAction SilentlyContinue
                 Write-Output "Created:{logon_name}"
             }}
             "#,
-            base_name = config.base_policy_name,
-            logon_name = config.logon_restrictions_name,
-            tier = tier,
-            target = config.target_ou,
         );
 
         let output = Command::new("powershell")
@@ -875,7 +723,7 @@ pub fn create_tier_gpos(domain_dn: &str) -> AppResult<Vec<String>> {
 
 /// Configure logon restrictions in an existing GPO
 /// This is an advanced operation that requires the GPO to exist
-#[cfg(windows)]
+
 pub fn configure_logon_restrictions(
     gpo_name: &str,
     deny_groups: &[String],
@@ -888,11 +736,15 @@ pub fn configure_logon_restrictions(
     }
 
     // Build the identity string for PowerShell
+    // Escape each group name to prevent PowerShell injection
     let identities: Vec<String> = deny_groups
         .iter()
-        .map(|g| format!("'{}'", g))
+        .map(|g| format!("'{}'", escape_powershell_string(g)))
         .collect();
     let identity_array = identities.join(", ");
+
+    // Escape the GPO name
+    let gpo_name_escaped = escape_powershell_string(gpo_name);
 
     // PowerShell script to configure user rights
     // Note: This is a simplified version - full implementation would use secedit
@@ -900,20 +752,18 @@ pub fn configure_logon_restrictions(
         r#"
         Import-Module GroupPolicy -ErrorAction Stop
 
-        $gpo = Get-GPO -Name '{gpo_name}'
+        $gpo = Get-GPO -Name '{gpo_name_escaped}'
         if (-not $gpo) {{
-            throw "GPO not found: {gpo_name}"
+            throw "GPO not found: {gpo_name_escaped}"
         }}
 
         # Note: Full logon restriction configuration requires secedit
         # This is a placeholder that verifies the GPO exists
-        Write-Output "GPO verified: {gpo_name}"
-        Write-Output "Deny groups configured: @({identities})"
+        Write-Output "GPO verified: {gpo_name_escaped}"
+        Write-Output "Deny groups configured: @({identity_array})"
 
         # For full implementation, use Set-ADTierLogonRestrictions from ADTierModel.psm1
         "#,
-        gpo_name = gpo_name,
-        identities = identity_array,
     );
 
     let output = Command::new("powershell")
@@ -1187,29 +1037,11 @@ pub fn initialize_tier_model(
 }
 
 /// Disable a user account by setting userAccountControl flag
-#[cfg(windows)]
+
 pub fn disable_account(object_dn: &str) -> AppResult<()> {
     tracing::info!(object_dn = object_dn, "Disabling account");
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-        let ldap_path = format!("LDAP://{}", object_dn);
-        let path_bstr = BSTR::from(ldap_path.as_str());
-
-        let mut obj: Option<IADs> = None;
-        ADsOpenObject(
-            PCWSTR(path_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADs as Interface>::IID,
-            &mut obj as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| AppError::LdapError(format!("Failed to open object {}: {}", object_dn, e)))?;
-
-        let obj = obj.ok_or_else(|| {
-            AppError::LdapError(format!("Object interface not available for {}", object_dn))
-        })?;
+        let obj: IADs = open_ad_object(object_dn)?;
 
         // Get current userAccountControl
         let uac_attr = BSTR::from("userAccountControl");
@@ -1254,29 +1086,11 @@ pub fn bulk_disable_accounts(object_dns: &[String]) -> Vec<Result<String, String
 
 /// Mark a service account as sensitive (cannot be delegated)
 /// This sets the TRUSTED_TO_AUTH_FOR_DELEGATION flag off and sets NOT_DELEGATED flag
-#[cfg(windows)]
+
 pub fn harden_service_account(object_dn: &str) -> AppResult<()> {
     tracing::info!(object_dn = object_dn, "Hardening service account");
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-        let ldap_path = format!("LDAP://{}", object_dn);
-        let path_bstr = BSTR::from(ldap_path.as_str());
-
-        let mut obj: Option<IADs> = None;
-        ADsOpenObject(
-            PCWSTR(path_bstr.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ADS_SECURE_AUTHENTICATION,
-            &<IADs as Interface>::IID,
-            &mut obj as *mut _ as *mut *mut std::ffi::c_void,
-        )
-        .map_err(|e| AppError::LdapError(format!("Failed to open object {}: {}", object_dn, e)))?;
-
-        let obj = obj.ok_or_else(|| {
-            AppError::LdapError(format!("Object interface not available for {}", object_dn))
-        })?;
+        let obj: IADs = open_ad_object(object_dn)?;
 
         // Get current userAccountControl
         let uac_attr = BSTR::from("userAccountControl");

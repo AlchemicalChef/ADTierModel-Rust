@@ -8,10 +8,14 @@ use crate::infrastructure::{
 };
 
 /// Get overall compliance status
+///
+/// # Arguments
+/// * `stale_threshold_days` - Optional number of days to consider an account stale (defaults to 90)
 #[tauri::command]
-pub async fn get_compliance_status() -> Result<ComplianceStatus, String> {
+pub async fn get_compliance_status(stale_threshold_days: Option<u32>) -> Result<ComplianceStatus, String> {
     let domain_dn = get_domain_dn()?;
-    infra_get_compliance_status(&domain_dn)
+    let threshold = stale_threshold_days.unwrap_or(90);
+    infra_get_compliance_status(&domain_dn, threshold)
 }
 
 /// Get cross-tier access violations specifically

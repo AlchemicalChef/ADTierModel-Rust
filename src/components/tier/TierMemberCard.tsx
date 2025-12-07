@@ -14,7 +14,8 @@ import {
   InformationCircleIcon,
 } from "@heroicons/react/24/outline";
 import { Menu } from "@headlessui/react";
-import type { TierMember, Tier0RoleType } from "../../types/tier";
+import type { TierMember } from "../../types/tier";
+import { getRoleLabel } from "../../types/tier";
 import { MoveObjectModal } from "../modals/MoveObjectModal";
 import { GroupMembershipModal } from "../modals/GroupMembershipModal";
 import { ObjectDetailsModal } from "../modals/ObjectDetailsModal";
@@ -55,21 +56,6 @@ function getObjectIcon(member: TierMember) {
       return UserGroupIcon;
     default:
       return ComputerDesktopIcon;
-  }
-}
-
-function getRoleLabel(roleType: Tier0RoleType): string {
-  switch (roleType) {
-    case "DomainController":
-      return "Domain Controller";
-    case "ADFS":
-      return "AD FS";
-    case "EntraConnect":
-      return "Entra Connect";
-    case "CertificateAuthority":
-      return "Certificate Authority";
-    case "PAW":
-      return "PAW";
   }
 }
 

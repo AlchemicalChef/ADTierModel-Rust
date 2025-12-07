@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   ShieldExclamationIcon,
   ShieldCheckIcon,
@@ -19,7 +19,6 @@ import {
 } from "@heroicons/react/24/outline";
 import { Menu, Dialog } from "@headlessui/react";
 import {
-  getComplianceStatus,
   moveObjectToTier,
   bulkDisableStaleAccounts,
   hardenServiceAccounts,
@@ -28,6 +27,7 @@ import {
   type ViolationSeverity,
   type ViolationType,
 } from "../../services/tauri";
+import { useComplianceStatus } from "../../hooks/useTierData";
 import { notify } from "../../store/notificationStore";
 import { tierConfig } from "../../types/tier";
 import type { TierLevel } from "../../types/tier";
@@ -472,10 +472,7 @@ export function ComplianceDashboard() {
     isLoading,
     refetch,
     isFetching,
-  } = useQuery({
-    queryKey: ["complianceStatus"],
-    queryFn: getComplianceStatus,
-  });
+  } = useComplianceStatus();
 
   // Record compliance snapshot when data is fetched
   useEffect(() => {

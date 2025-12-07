@@ -5,7 +5,7 @@
 
 use crate::domain::Tier;
 use crate::error::AppResult;
-#[cfg(windows)]
+
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 
@@ -146,7 +146,7 @@ impl EndpointGpoConfigResult {
 }
 
 /// Get status of all endpoint protection GPOs
-#[cfg(windows)]
+
 pub fn get_all_endpoint_gpo_status(domain_dn: &str) -> AppResult<Vec<EndpointGpoStatus>> {
     use std::process::Command;
 
@@ -368,13 +368,7 @@ pub fn get_all_endpoint_gpo_status(domain_dn: &str) -> AppResult<Vec<EndpointGpo
     Ok(statuses)
 }
 
-#[cfg(not(windows))]
-pub fn get_all_endpoint_gpo_status(_domain_dn: &str) -> AppResult<Vec<EndpointGpoStatus>> {
-    Ok(vec![])
-}
-
 /// Configure the baseline audit policy GPO for a specific tier
-#[cfg(windows)]
 pub fn configure_audit_baseline_gpo(tier: Tier, domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
     use std::process::Command;
 
@@ -544,15 +538,7 @@ gPCMachineExtensionNames=$cseGuid
     Ok(result)
 }
 
-#[cfg(not(windows))]
-pub fn configure_audit_baseline_gpo(_tier: Tier, _domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
-    let mut result = EndpointGpoConfigResult::new("AuditBaseline", "SEC-Audit-Baseline");
-    result.add_error("GPO configuration is only available on Windows".to_string());
-    Ok(result)
-}
-
 /// Configure the enhanced audit policy GPO for a specific tier
-#[cfg(windows)]
 pub fn configure_audit_enhanced_gpo(tier: Tier, domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
     use std::process::Command;
 
@@ -733,15 +719,7 @@ gPCMachineExtensionNames=$cseGuids
     Ok(result)
 }
 
-#[cfg(not(windows))]
-pub fn configure_audit_enhanced_gpo(_tier: Tier, _domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
-    let mut result = EndpointGpoConfigResult::new("AuditEnhanced", "SEC-Audit-Enhanced");
-    result.add_error("GPO configuration is only available on Windows".to_string());
-    Ok(result)
-}
-
 /// Configure the essential DC audit policy GPO
-#[cfg(windows)]
 pub fn configure_dc_audit_essential_gpo(domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
     use std::process::Command;
 
@@ -905,15 +883,7 @@ gPCMachineExtensionNames=$cseGuid
     Ok(result)
 }
 
-#[cfg(not(windows))]
-pub fn configure_dc_audit_essential_gpo(_domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
-    let mut result = EndpointGpoConfigResult::new("DcAuditEssential", "SEC-DC-Audit-Essential");
-    result.add_error("GPO configuration is only available on Windows".to_string());
-    Ok(result)
-}
-
 /// Configure the comprehensive DC audit policy GPO
-#[cfg(windows)]
 pub fn configure_dc_audit_comprehensive_gpo(domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
     use std::process::Command;
 
@@ -1083,15 +1053,7 @@ gPCMachineExtensionNames=$cseGuids
     Ok(result)
 }
 
-#[cfg(not(windows))]
-pub fn configure_dc_audit_comprehensive_gpo(_domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
-    let mut result = EndpointGpoConfigResult::new("DcAuditComprehensive", "SEC-DC-Audit-Comprehensive");
-    result.add_error("GPO configuration is only available on Windows".to_string());
-    Ok(result)
-}
-
 /// Configure the Defender protection GPO (domain-wide)
-#[cfg(windows)]
 pub fn configure_defender_gpo(domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
     use std::process::Command;
 
@@ -1247,15 +1209,7 @@ gPCMachineExtensionNames=$cseGuids
     Ok(result)
 }
 
-#[cfg(not(windows))]
-pub fn configure_defender_gpo(_domain_dn: &str) -> AppResult<EndpointGpoConfigResult> {
-    let mut result = EndpointGpoConfigResult::new("DefenderProtection", "SEC-Defender-Protection");
-    result.add_error("GPO configuration is only available on Windows".to_string());
-    Ok(result)
-}
-
 /// Delete an endpoint protection GPO
-#[cfg(windows)]
 pub fn delete_endpoint_gpo(gpo_type: EndpointGpoType, tier: Option<Tier>) -> AppResult<()> {
     use std::process::Command;
 
@@ -1286,9 +1240,4 @@ pub fn delete_endpoint_gpo(gpo_type: EndpointGpoType, tier: Option<Tier>) -> App
     }
 
     Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn delete_endpoint_gpo(_gpo_type: EndpointGpoType, _tier: Option<Tier>) -> AppResult<()> {
-    Err(AppError::GpoError("GPO deletion is only available on Windows".to_string()))
 }

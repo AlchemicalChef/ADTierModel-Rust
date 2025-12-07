@@ -20,6 +20,25 @@ impl Tier {
         }
     }
 
+    /// Extract tier from a Distinguished Name by parsing OU components.
+    /// This properly parses the DN to find exact OU matches, avoiding false positives
+    /// from substring matching (e.g., "OU=Tier0Testing" won't match Tier0).
+    pub fn from_dn(dn: &str) -> Option<Self> {
+        for component in dn.split(',') {
+            let component = component.trim().to_lowercase();
+            if component == "ou=tier0" {
+                return Some(Tier::Tier0);
+            }
+            if component == "ou=tier1" {
+                return Some(Tier::Tier1);
+            }
+            if component == "ou=tier2" {
+                return Some(Tier::Tier2);
+            }
+        }
+        None
+    }
+
     /// Get the OU relative path for this tier
     pub fn ou_path(&self) -> &'static str {
         match self {
@@ -27,6 +46,11 @@ impl Tier {
             Tier::Tier1 => "OU=Tier1",
             Tier::Tier2 => "OU=Tier2",
         }
+    }
+
+    /// Get the full OU distinguished name for this tier
+    pub fn full_ou_dn(&self, domain_dn: &str) -> String {
+        format!("{},{}", self.ou_path(), domain_dn)
     }
 
     /// Get display name

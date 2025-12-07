@@ -15,7 +15,33 @@ export type Tier0RoleType =
   | "ADFS"
   | "EntraConnect"
   | "CertificateAuthority"
-  | "PAW";
+  | "PAW"
+  | "SchemaMaster"
+  | "DomainNamingMaster"
+  | "RIDMaster"
+  | "PDCEmulator"
+  | "InfrastructureMaster";
+
+// Human-readable labels for Tier 0 role types
+const roleLabels: Record<Tier0RoleType, string> = {
+  DomainController: "Domain Controller",
+  ADFS: "AD FS",
+  EntraConnect: "Entra Connect",
+  CertificateAuthority: "Certificate Authority",
+  PAW: "Privileged Access Workstation",
+  SchemaMaster: "Schema Master",
+  DomainNamingMaster: "Domain Naming Master",
+  RIDMaster: "RID Master",
+  PDCEmulator: "PDC Emulator",
+  InfrastructureMaster: "Infrastructure Master",
+};
+
+/**
+ * Get the human-readable label for a Tier 0 role type
+ */
+export function getRoleLabel(roleType: Tier0RoleType): string {
+  return roleLabels[roleType];
+}
 
 // Risk levels for compliance
 export type RiskLevel = "Critical" | "High" | "Medium" | "Low";

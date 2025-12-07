@@ -20,23 +20,34 @@ static AD_CONNECTION: Lazy<Mutex<Option<AdConnection>>> = Lazy::new(|| Mutex::ne
 
 /// Get or create AD connection
 fn get_connection() -> Result<std::sync::MutexGuard<'static, Option<AdConnection>>, String> {
+    // First check if connection already exists (fast path)
+    {
+        let conn = AD_CONNECTION.lock().map_err(|e| {
+            tracing::error!(error = %e, "Failed to acquire AD connection lock");
+            format!("Lock error: {}", e)
+        })?;
+        if conn.is_some() {
+            return Ok(conn);
+        }
+    } // Lock released here - don't hold during slow connect
+
+    // Connect without holding the lock to avoid blocking other threads
+    tracing::debug!("No existing AD connection, attempting to connect");
+    let new_conn = AdConnection::connect().map_err(|e| {
+        tracing::error!(error = %e, "Failed to connect to AD");
+        format!("Failed to connect to AD: {}", e)
+    })?;
+    tracing::info!("AD connection established");
+
+    // Re-acquire lock and store connection
     let mut conn = AD_CONNECTION.lock().map_err(|e| {
         tracing::error!(error = %e, "Failed to acquire AD connection lock");
         format!("Lock error: {}", e)
     })?;
 
+    // Check if another thread connected while we were connecting
     if conn.is_none() {
-        tracing::debug!("No existing AD connection, attempting to connect");
-        match AdConnection::connect() {
-            Ok(c) => {
-                tracing::info!("AD connection established");
-                *conn = Some(c);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to connect to AD");
-                return Err(format!("Failed to connect to AD: {}", e));
-            }
-        }
+        *conn = Some(new_conn);
     }
 
     Ok(conn)

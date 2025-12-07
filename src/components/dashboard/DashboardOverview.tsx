@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import {
   ShieldCheckIcon,
   ServerIcon,
@@ -15,7 +14,8 @@ import {
   DocumentArrowUpIcon,
 } from "@heroicons/react/24/outline";
 import { useTierStore } from "../../store/tierStore";
-import { getComplianceStatus, type ComplianceStatus } from "../../services/tauri";
+import { type ComplianceStatus } from "../../services/tauri";
+import { useComplianceStatus } from "../../hooks/useTierData";
 import { tierConfig } from "../../types/tier";
 import type { TierLevel } from "../../types/tier";
 import { CreateAdminWizard } from "../admin";
@@ -275,11 +275,7 @@ export function DashboardOverview({ onNavigateToTier, onNavigateToCompliance }: 
   const [showCreateAdminWizard, setShowCreateAdminWizard] = useState(false);
   const [showCsvImport, setShowCsvImport] = useState(false);
 
-  const { data: compliance, isLoading: complianceLoading } = useQuery({
-    queryKey: ["complianceStatus"],
-    queryFn: getComplianceStatus,
-    staleTime: 60_000,
-  });
+  const { data: compliance, isLoading: complianceLoading } = useComplianceStatus();
 
   const totalObjects = Object.values(tierCounts).reduce((a, b) => a + b, 0);
 

@@ -154,12 +154,12 @@ export function useAutoRefresh() {
 
 // Hook to fetch compliance status with auto-refresh support
 export function useComplianceStatus() {
-  const { autoRefreshInterval } = useSettingsStore();
+  const { autoRefreshInterval, staleAccountThresholdDays } = useSettingsStore();
   const intervalMs = getRefreshIntervalMs(autoRefreshInterval);
 
   return useQuery({
-    queryKey: ["complianceStatus"],
-    queryFn: getComplianceStatus,
+    queryKey: ["complianceStatus", staleAccountThresholdDays],
+    queryFn: () => getComplianceStatus(staleAccountThresholdDays),
     staleTime: 30_000,
     refetchInterval: intervalMs || false,
   });
