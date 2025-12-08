@@ -346,12 +346,21 @@ pub async fn get_expected_groups() -> Result<Vec<String>, String> {
 // ============================================================================
 
 /// Move an AD object to a specific tier
+///
+/// This function enforces TLA+ guards:
+/// - INV-10 (ServiceAccountHardening): Service accounts must be hardened before moving to Tier0/Tier1
+/// - INV-4 (ObjectTierConsistency): Warns if object has conflicting admin group memberships
 #[tauri::command]
 pub async fn move_object_to_tier(
     object_dn: String,
     target_tier: String,
     sub_ou: Option<String>,
 ) -> Result<String, String> {
+    use crate::infrastructure::{
+        check_service_account_hardening_guard,
+        check_object_tier_consistency,
+    };
+
     tracing::info!(
         object_dn = object_dn.as_str(),
         target_tier = target_tier.as_str(),
@@ -387,6 +396,38 @@ pub async fn move_object_to_tier(
     };
     drop(conn);
 
+    // TLA+ Guard: Check service account hardening for privileged tiers
+    // Implements MoveObjectToTier guard from ADTierModel.tla lines 425-429
+    tracing::info!(
+        object_dn = object_dn.as_str(),
+        target_tier = target_tier.as_str(),
+        "Checking service account hardening guard"
+    );
+    check_service_account_hardening_guard(&object_dn, tier)?;
+
+    // TLA+ Guard: Check object-tier consistency (warn about conflicting groups)
+    // Implements invariant INV-4 (ObjectTierConsistency)
+    match check_object_tier_consistency(&object_dn, tier, &domain_dn) {
+        Ok(conflicting_groups) => {
+            if !conflicting_groups.is_empty() {
+                tracing::warn!(
+                    object_dn = object_dn.as_str(),
+                    target_tier = target_tier.as_str(),
+                    conflicting_groups = ?conflicting_groups,
+                    "Object has admin group memberships in other tiers - this may cause compliance violations"
+                );
+                // Note: We warn but don't block the move. The compliance dashboard will detect this.
+                // A future enhancement could block or offer to remove conflicting memberships.
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to check object tier consistency, proceeding with move"
+            );
+        }
+    }
+
     // Build target OU path
     let target_ou = if let Some(sub_ou) = sub {
         format!("OU={},OU={},{}", sub_ou.as_str(), tier, domain_dn)
@@ -398,12 +439,18 @@ pub async fn move_object_to_tier(
 }
 
 /// Add a member to a tier group
+///
+/// This function enforces TLA+ invariant INV-1 (TierIsolation) by checking
+/// that adding a member to an admin group would not give them admin access
+/// to multiple tiers.
 #[tauri::command]
 pub async fn add_to_tier_group(
     member_dn: String,
     tier_name: String,
     group_suffix: String,
 ) -> Result<(), String> {
+    use crate::infrastructure::check_tier_isolation_guard;
+
     let tier = match tier_name.as_str() {
         "Tier0" => Tier::Tier0,
         "Tier1" => Tier::Tier1,
@@ -426,6 +473,17 @@ pub async fn add_to_tier_group(
         None => return Err("Not connected".to_string()),
     };
     drop(conn);
+
+    // TLA+ Guard: Check tier isolation before adding to admin groups
+    // Implements AddToTierGroup guard from ADTierModel.tla lines 440-448
+    tracing::info!(
+        member_dn = member_dn.as_str(),
+        tier = tier_name.as_str(),
+        group_suffix = group_suffix.as_str(),
+        "Checking tier isolation guard before adding member to group"
+    );
+
+    check_tier_isolation_guard(&member_dn, tier, suffix, &domain_dn)?;
 
     let group_dn = crate::domain::tier_group_dn(tier, suffix, &domain_dn);
 

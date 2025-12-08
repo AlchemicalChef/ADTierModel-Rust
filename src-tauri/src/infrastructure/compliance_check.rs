@@ -1,18 +1,287 @@
 //! Compliance checking for AD Tier Model
 //!
 //! Detects violations of tier separation and other compliance issues.
+//! Also provides guard functions to prevent violations during write operations.
 
 use crate::domain::{
-    ComplianceStatus, ComplianceViolation, CrossTierAccess, Tier, ViolationSeverity, ViolationType,
+    ComplianceStatus, ComplianceViolation, CrossTierAccess, GroupSuffix, Tier, ViolationSeverity, ViolationType,
 };
 use crate::infrastructure::ad_connection::AdConnection;
-use crate::infrastructure::ad_search::{ldap_search, SearchScope, escape_ldap_filter};
+use crate::infrastructure::ad_search::{ldap_search, SearchScope, escape_ldap_filter, LDAP_MATCHING_RULE_IN_CHAIN};
+use std::collections::HashSet;
 
 /// Get the domain DN for compliance checks
 
 pub fn get_domain_dn() -> Result<String, String> {
     let conn = AdConnection::connect().map_err(|e| format!("Failed to connect to AD: {:?}", e))?;
     Ok(conn.domain_dn.clone())
+}
+
+// ============================================================================
+// TLA+ GUARD FUNCTIONS - Enforce invariants during write operations
+// These functions implement the guards specified in the TLA+ model to prevent
+// tier isolation violations rather than just detecting them after the fact.
+// ============================================================================
+
+/// Get the admin tiers that a member currently has access to.
+/// This is used as a guard before adding members to admin groups.
+///
+/// Implements TLA+ function: AdminTiers(obj) from ADTierModel.tla lines 166-167
+/// Uses LDAP_MATCHING_RULE_IN_CHAIN for transitive group membership checking.
+///
+/// # Arguments
+/// * `member_dn` - Distinguished name of the member to check
+/// * `domain_dn` - Domain distinguished name for LDAP searches
+///
+/// # Returns
+/// * `Ok(HashSet<Tier>)` - Set of tiers where the member has admin group membership
+/// * `Err(String)` - Error message if the check fails
+pub fn get_member_admin_tiers(member_dn: &str, domain_dn: &str) -> Result<HashSet<Tier>, String> {
+    let mut admin_tiers: HashSet<Tier> = HashSet::new();
+
+    // Check each tier's admin groups (Admins and Operators grant admin privileges)
+    for tier in &[Tier::Tier0, Tier::Tier1, Tier::Tier2] {
+        let groups_ou = format!("OU=Groups,{},{}", tier.ou_path(), domain_dn);
+
+        // Get admin groups (Admins and Operators) in this tier
+        for suffix in &[GroupSuffix::Admins, GroupSuffix::Operators] {
+            let group_name = format!("{}-{}", tier, suffix.as_str());
+
+            // Find the group DN
+            let group_filter = format!(
+                "(&(objectClass=group)(sAMAccountName={}))",
+                escape_ldap_filter(&group_name)
+            );
+
+            let group_results = ldap_search(
+                &groups_ou,
+                &group_filter,
+                &["distinguishedName"],
+                SearchScope::OneLevel,
+            ).unwrap_or_default();
+
+            if let Some(group_result) = group_results.first() {
+                if let Some(group_dn) = group_result.get("distinguishedname") {
+                    // Check if member is in this group using LDAP_MATCHING_RULE_IN_CHAIN
+                    // This catches both direct and nested membership
+                    let member_filter = format!(
+                        "(&(distinguishedName={})(memberOf:{}:={}))",
+                        escape_ldap_filter(member_dn),
+                        LDAP_MATCHING_RULE_IN_CHAIN,
+                        escape_ldap_filter(group_dn)
+                    );
+
+                    if let Ok(member_results) = ldap_search(
+                        domain_dn,
+                        &member_filter,
+                        &["distinguishedName"],
+                        SearchScope::Subtree,
+                    ) {
+                        if !member_results.is_empty() {
+                            admin_tiers.insert(*tier);
+                            tracing::debug!(
+                                member_dn = member_dn,
+                                group = group_name,
+                                tier = ?tier,
+                                "Member has admin access in tier"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(admin_tiers)
+}
+
+/// Check if adding a member to an admin group would violate tier isolation.
+/// This implements the guard from TLA+ AddToTierGroup action (lines 440-448).
+///
+/// TLA+ Guard:
+/// ```
+/// IsAdminGroup(group) =>
+///   LET currentAdminTiers == AdminTiers(obj)
+///       newTier == TierOfGroup(group)
+///   IN \/ currentAdminTiers = {}
+///      \/ currentAdminTiers = {newTier}
+/// ```
+///
+/// # Arguments
+/// * `member_dn` - Distinguished name of the member to add
+/// * `target_tier` - The tier of the group being added to
+/// * `group_suffix` - The type of group (Admins, Operators, etc.)
+/// * `domain_dn` - Domain distinguished name
+///
+/// # Returns
+/// * `Ok(())` - Addition is allowed
+/// * `Err(String)` - Addition would violate tier isolation
+pub fn check_tier_isolation_guard(
+    member_dn: &str,
+    target_tier: Tier,
+    group_suffix: GroupSuffix,
+    domain_dn: &str,
+) -> Result<(), String> {
+    // Only check for admin groups (Admins and Operators grant privileged access)
+    let is_admin_group = matches!(group_suffix, GroupSuffix::Admins | GroupSuffix::Operators);
+
+    if !is_admin_group {
+        // Non-admin groups (Readers, ServiceAccounts, JumpServers) don't require tier isolation
+        return Ok(());
+    }
+
+    // Get current admin tiers for the member
+    let current_admin_tiers = get_member_admin_tiers(member_dn, domain_dn)?;
+
+    tracing::debug!(
+        member_dn = member_dn,
+        target_tier = ?target_tier,
+        current_tiers = ?current_admin_tiers,
+        "Checking tier isolation guard"
+    );
+
+    // TLA+ Guard: currentAdminTiers = {} \/ currentAdminTiers = {newTier}
+    if current_admin_tiers.is_empty() {
+        // No existing admin access - OK to add
+        return Ok(());
+    }
+
+    if current_admin_tiers.len() == 1 && current_admin_tiers.contains(&target_tier) {
+        // Already has admin access only in the target tier - OK to add
+        return Ok(());
+    }
+
+    // Violation: member already has admin access in a different tier
+    let existing_tiers: Vec<String> = current_admin_tiers
+        .iter()
+        .map(|t| format!("{:?}", t))
+        .collect();
+
+    Err(format!(
+        "TIER ISOLATION VIOLATION: Cannot add member to {:?} admin group. \
+         Member already has admin access in: {}. \
+         Per TLA+ invariant INV-1 (TierIsolation), a user cannot have admin rights in multiple tiers. \
+         Remove existing admin group memberships first.",
+        target_tier,
+        existing_tiers.join(", ")
+    ))
+}
+
+/// Check if an object is a service account based on its location in the OU structure.
+/// Service accounts are expected to be in the ServiceAccounts sub-OU of a tier.
+pub fn is_service_account(object_dn: &str) -> bool {
+    object_dn.to_lowercase().contains("ou=serviceaccounts")
+}
+
+/// Check if a service account is hardened (marked as sensitive and cannot be delegated).
+/// This checks the userAccountControl flag NOT_DELEGATED (0x100000).
+///
+/// # Arguments
+/// * `object_dn` - Distinguished name of the service account
+///
+/// # Returns
+/// * `Ok(true)` - Account is hardened
+/// * `Ok(false)` - Account is not hardened
+/// * `Err(String)` - Failed to check
+pub fn is_service_account_hardened(object_dn: &str) -> Result<bool, String> {
+    let results = ldap_search(
+        object_dn,
+        "(objectClass=*)",
+        &["userAccountControl"],
+        SearchScope::Base,
+    ).map_err(|e| format!("Failed to query service account: {:?}", e))?;
+
+    if let Some(result) = results.first() {
+        if let Some(uac_str) = result.get("useraccountcontrol") {
+            let uac: u32 = uac_str.parse().unwrap_or(0);
+            // NOT_DELEGATED flag = 0x100000 (1048576)
+            let is_sensitive = (uac & 0x100000) != 0;
+            return Ok(is_sensitive);
+        }
+    }
+
+    // If we can't determine, assume not hardened for safety
+    Ok(false)
+}
+
+/// Check if moving an object to a privileged tier is allowed.
+/// Implements TLA+ guard from MoveObjectToTier action (lines 425-436).
+///
+/// TLA+ Guard:
+/// ```
+/// (obj \in ServiceAccounts /\ targetTier \in {"Tier0", "Tier1"}) =>
+///     serviceAccountSensitive[obj] = TRUE
+/// ```
+///
+/// # Arguments
+/// * `object_dn` - Distinguished name of the object being moved
+/// * `target_tier` - The tier the object is being moved to
+///
+/// # Returns
+/// * `Ok(())` - Move is allowed
+/// * `Err(String)` - Move would violate service account hardening requirement
+pub fn check_service_account_hardening_guard(
+    object_dn: &str,
+    target_tier: Tier,
+) -> Result<(), String> {
+    // Only check for privileged tiers
+    if !matches!(target_tier, Tier::Tier0 | Tier::Tier1) {
+        return Ok(());
+    }
+
+    // Only check for service accounts
+    if !is_service_account(object_dn) {
+        return Ok(());
+    }
+
+    // Check if the service account is hardened
+    let is_hardened = is_service_account_hardened(object_dn)?;
+
+    if !is_hardened {
+        return Err(format!(
+            "SERVICE ACCOUNT HARDENING VIOLATION: Cannot move service account to {:?}. \
+             Per TLA+ invariant INV-10 (ServiceAccountHardening), service accounts must be \
+             marked as 'Account is sensitive and cannot be delegated' before moving to \
+             privileged tiers (Tier0 or Tier1). \
+             Harden the service account first using the compliance remediation tools.",
+            target_tier
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check if an object's current group memberships are consistent with a target tier.
+/// Used when moving objects to ensure they don't have conflicting admin group memberships.
+///
+/// Implements TLA+ invariant INV-4 (ObjectTierConsistency).
+///
+/// # Arguments
+/// * `object_dn` - Distinguished name of the object being moved
+/// * `target_tier` - The tier the object is being moved to
+/// * `domain_dn` - Domain distinguished name
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - List of conflicting groups (empty if none)
+/// * `Err(String)` - Failed to check
+pub fn check_object_tier_consistency(
+    object_dn: &str,
+    target_tier: Tier,
+    domain_dn: &str,
+) -> Result<Vec<String>, String> {
+    let mut conflicting_groups: Vec<String> = Vec::new();
+
+    // Get current admin tiers
+    let current_admin_tiers = get_member_admin_tiers(object_dn, domain_dn)?;
+
+    // Check if any admin tier conflicts with target
+    for tier in current_admin_tiers {
+        if tier != target_tier {
+            conflicting_groups.push(format!("{:?}-Admins or {:?}-Operators", tier, tier));
+        }
+    }
+
+    Ok(conflicting_groups)
 }
 
 /// Check for cross-tier access violations
@@ -367,7 +636,7 @@ pub fn get_compliance_status(domain_dn: &str, stale_threshold_days: u32) -> Resu
     }
 
     // Check stale accounts using configurable threshold
-    let stale = check_stale_accounts(domain_dn, stale_threshold_days)?;
+    let stale = check_stale_accounts(domain_dn, stale_threshold_days as i64)?;
     for violation in stale {
         status.add_violation(violation);
     }
