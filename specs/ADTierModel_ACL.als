@@ -770,5 +770,318 @@ check NoDanglingOwners for 5 but exactly 4 Tier, exactly 2 ACEType
 check NoSelfEscalationToProtectedGroups for 6 but exactly 4 Tier, exactly 2 ACEType
 
 // ============================================================================
+// PART 15: Multi-Hop Transitive Attack Chains
+// ============================================================================
+
+// Define compromise as a relation for transitive closure
+// This enables using Alloy's ^ operator for multi-hop paths
+fun compromisesRel: Principal -> Principal {
+    { attacker: Principal, target: Principal |
+        attacker != target and canCompromise[attacker, target] }
+}
+
+// Transitive closure of compromise - multi-hop attack paths
+// Uses Alloy's built-in transitive closure operator ^
+pred canCompromiseTransitive[attacker: Principal, target: Principal] {
+    attacker != target and
+    target in attacker.^compromisesRel
+}
+
+// Cross-tier transitive violation (most dangerous)
+pred transitiveCrossTierViolation[attacker: Principal, target: Principal] {
+    higherPrivilege[target.tier, attacker.tier] and
+    canCompromiseTransitive[attacker, target]
+}
+
+// Any multi-hop cross-tier path exists
+pred anyTransitiveCrossTierPath {
+    some attacker: Principal, target: Principal |
+        transitiveCrossTierViolation[attacker, target]
+}
+
+// Specific transitive tier paths
+pred transitiveTier2ToTier0Path {
+    some attacker: Principal, target: Principal |
+        attacker.tier = Tier2 and
+        target.tier = Tier0 and
+        canCompromiseTransitive[attacker, target]
+}
+
+pred transitiveTier2ToTier1Path {
+    some attacker: Principal, target: Principal |
+        attacker.tier = Tier2 and
+        target.tier = Tier1 and
+        canCompromiseTransitive[attacker, target]
+}
+
+pred transitiveTier1ToTier0Path {
+    some attacker: Principal, target: Principal |
+        attacker.tier = Tier1 and
+        target.tier = Tier0 and
+        canCompromiseTransitive[attacker, target]
+}
+
+// ASSERT-10: No transitive path from Tier2 to Tier0
+assert NoTransitiveTier2ToTier0 {
+    not transitiveTier2ToTier0Path
+}
+
+// ASSERT-11: No transitive path from Tier1 to Tier0
+assert NoTransitiveTier1ToTier0 {
+    not transitiveTier1ToTier0Path
+}
+
+// Run command for multi-hop attack discovery
+run findMultiHopAttack {
+    some attacker, target, intermediate: Principal |
+        attacker.tier = Tier2 and
+        target.tier = Tier0 and
+        intermediate.tier = Tier1 and
+        canCompromise[attacker, intermediate] and
+        canCompromise[intermediate, target]
+} for 8 but exactly 4 Tier, exactly 2 ACEType
+
+// ============================================================================
+// PART 16: Active Directory Certificate Services (ADCS) Attacks
+// ============================================================================
+
+// Certificate Authority hierarchy
+sig CertificateAuthority extends Computer {
+    isEnterprise: one Bool,
+    templates: set CertificateTemplate,
+    sanFlagEnabled: one Bool              // EDITF_ATTRIBUTESUBJECTALTNAME2 (ESC6)
+}
+
+// Certificate Templates - AD objects that define certificate issuance rules
+sig CertificateTemplate {
+    templateDacl: one DACL,                // ACL on the template object itself
+    enrollmentRights: set Principal,       // Who can request certificates
+    autoEnrollmentEnabled: one Bool,
+    allowsSANOverride: one Bool,           // ESC1: Can requester specify SAN?
+    authenticationEKU: one Bool,           // Can be used for authentication
+    requiresManagerApproval: one Bool,
+    authorizedSignatures: Int,             // ESC2: 0 = no signature required
+    schemaVersion: Int
+}
+
+// ESC1: Template allows SAN override + low-privilege enrollment + auth EKU
+// This is the most common and dangerous ADCS misconfiguration
+pred hasESC1Vulnerability[template: CertificateTemplate] {
+    template.allowsSANOverride = True and
+    template.authenticationEKU = True and
+    template.requiresManagerApproval = False and
+    some lowPrivUser: User |
+        lowPrivUser.tier != Tier0 and
+        lowPrivUser in template.enrollmentRights
+}
+
+// ESC1 Attack: Request cert as another user via SAN manipulation
+pred canExploitESC1[attacker: Principal, victim: Principal] {
+    some ca: CertificateAuthority, template: CertificateTemplate |
+        template in ca.templates and
+        hasESC1Vulnerability[template] and
+        attacker in template.enrollmentRights and
+        victim.tier = Tier0  // Targeting Tier0 identity
+}
+
+// ESC2: Template has overly permissive EKU (Any Purpose or no restrictions)
+pred hasESC2Vulnerability[template: CertificateTemplate] {
+    template.authenticationEKU = True and
+    template.authorizedSignatures = 0
+}
+
+// ESC4: Vulnerable template ACLs - attacker can modify template itself
+pred canExploitESC4[attacker: Principal, template: CertificateTemplate] {
+    hasFullControl[attacker, template.templateDacl] or
+    hasRight[attacker, template.templateDacl, GenericWrite]
+}
+
+// ESC6: CA has EDITF_ATTRIBUTESUBJECTALTNAME2 flag enabled
+// Allows SAN override on any request regardless of template
+pred hasESC6Vulnerability[ca: CertificateAuthority] {
+    ca.isEnterprise = True and
+    ca.sanFlagEnabled = True
+}
+
+// ESC6 Attack: Request cert with arbitrary SAN due to CA flag
+pred canExploitESC6[attacker: Principal, ca: CertificateAuthority, victim: Principal] {
+    hasESC6Vulnerability[ca] and
+    some template: CertificateTemplate |
+        template in ca.templates and
+        template.authenticationEKU = True and
+        attacker in template.enrollmentRights and
+        victim.tier = Tier0
+}
+
+// ESC7: CA has vulnerable ACLs (ManageCA, ManageCertificates rights)
+pred canExploitESC7[attacker: Principal, ca: CertificateAuthority] {
+    let caDacl = getDACL[ca] |
+    hasFullControl[attacker, caDacl]
+}
+
+// Combined: Any ADCS escalation path to Tier0
+pred canEscalateViaADCS[attacker: Principal] {
+    attacker.tier != Tier0 and (
+        (some victim: Principal | victim.tier = Tier0 and canExploitESC1[attacker, victim]) or
+        (some template: CertificateTemplate | canExploitESC4[attacker, template]) or
+        (some ca: CertificateAuthority, victim: Principal |
+            victim.tier = Tier0 and canExploitESC6[attacker, ca, victim]) or
+        (some ca: CertificateAuthority | canExploitESC7[attacker, ca])
+    )
+}
+
+// ASSERT-12: No ADCS escalation from non-Tier0 to Tier0
+assert NoADCSEscalationToTier0 {
+    no attacker: Principal |
+        canEscalateViaADCS[attacker]
+}
+
+// ASSERT-13: No ESC1 vulnerable templates should exist
+assert NoESC1VulnerableTemplates {
+    no template: CertificateTemplate |
+        hasESC1Vulnerability[template]
+}
+
+// Run command for ADCS attack discovery
+run findADCSAttack {
+    some attacker: Principal, victim: Principal |
+        attacker.tier = Tier2 and
+        victim.tier = Tier0 and
+        canExploitESC1[attacker, victim]
+} for 6 but exactly 4 Tier, exactly 2 ACEType
+
+run findESC6Attack {
+    some attacker: Principal, ca: CertificateAuthority, victim: Principal |
+        attacker.tier != Tier0 and
+        victim.tier = Tier0 and
+        canExploitESC6[attacker, ca, victim]
+} for 6 but exactly 4 Tier, exactly 2 ACEType
+
+// ============================================================================
+// PART 17: Group Policy Object (GPO) Abuse Paths
+// ============================================================================
+
+// Group Policy Object - can be used to execute code on affected systems
+sig GroupPolicyObject extends ADObject {
+    gpoLinks: set Container,              // OUs/Domain this GPO is linked to
+    gpoEnabled: one Bool,
+    userConfiguration: one Bool,          // Has user settings
+    computerConfiguration: one Bool       // Has computer settings
+}
+
+// Can modify GPO content (scripts, settings, preferences)
+pred canModifyGPO[attacker: Principal, gpo: GroupPolicyObject] {
+    let gpoDacl = gpo.securityDescriptor.dacl |
+    hasFullControl[attacker, gpoDacl] or
+    hasRight[attacker, gpoDacl, GenericWrite] or
+    hasRight[attacker, gpoDacl, WriteDacl]
+}
+
+// Can link GPO to a container (OU/Domain) via gpLink attribute
+pred canLinkGPO[attacker: Principal, container: Container] {
+    let containerDacl = container.securityDescriptor.dacl |
+    hasPropertyWriteRight[attacker, containerDacl, GpLinkProperty]
+}
+
+// Principals affected by a GPO (in linked containers or child containers)
+fun affectedByGPO[gpo: GroupPolicyObject]: set Principal {
+    { p: Principal | some c: Container |
+        c in gpo.gpoLinks and
+        (p.parent = c or (some parentOU: Container | p.parent = parentOU and parentOU.parent = c)) }
+}
+
+// GPO compromise leads to code execution on affected systems
+// Attacker can add startup scripts, scheduled tasks, or other persistence
+pred canCompromiseViaGPO[attacker: Principal, target: Principal] {
+    some gpo: GroupPolicyObject |
+        canModifyGPO[attacker, gpo] and
+        target in affectedByGPO[gpo] and
+        gpo.gpoEnabled = True and
+        (gpo.computerConfiguration = True or gpo.userConfiguration = True)
+}
+
+// Cross-tier GPO abuse detection
+pred gpoCrossTierEscalation {
+    some attacker: Principal, target: Principal |
+        higherPrivilege[target.tier, attacker.tier] and
+        canCompromiseViaGPO[attacker, target]
+}
+
+// ASSERT-14: No GPO-based escalation to Tier0
+assert NoGPOEscalationToTier0 {
+    no attacker: Principal, target: Principal |
+        attacker.tier != Tier0 and
+        target.tier = Tier0 and
+        canCompromiseViaGPO[attacker, target]
+}
+
+// ASSERT-15: Tier0 GPOs cannot be modified by lower tiers
+assert Tier0GPOsProtected {
+    all gpo: GroupPolicyObject |
+        (some c: Container | c in gpo.gpoLinks and c.tier = Tier0) implies
+            (all attacker: Principal |
+                canModifyGPO[attacker, gpo] implies attacker.tier = Tier0)
+}
+
+// Run command for GPO attack discovery
+run findGPOAttack {
+    some attacker: Principal, target: Principal |
+        attacker.tier = Tier2 and
+        target.tier = Tier0 and
+        canCompromiseViaGPO[attacker, target]
+} for 6 but exactly 4 Tier, exactly 2 ACEType
+
+// ============================================================================
+// PART 18: Combined Attack Path Analysis
+// ============================================================================
+
+// Combined: All attack vectors that can lead to Tier0 compromise
+pred canReachTier0[attacker: Principal] {
+    attacker.tier != Tier0 and (
+        // Direct single-hop attacks
+        (some target: Principal | target.tier = Tier0 and canCompromise[attacker, target]) or
+        // Multi-hop transitive attacks
+        (some target: Principal | target.tier = Tier0 and canCompromiseTransitive[attacker, target]) or
+        // ADCS-based attacks
+        canEscalateViaADCS[attacker] or
+        // GPO-based attacks
+        (some target: Principal | target.tier = Tier0 and canCompromiseViaGPO[attacker, target]) or
+        // Protected group escalation
+        (some pg: ProtectedGroup | groupMembershipCompromise[attacker, pg])
+    )
+}
+
+// ASSERT-16: Complete tier isolation (no attack vector reaches Tier0)
+assert CompleteTierIsolation {
+    no attacker: Principal | canReachTier0[attacker]
+}
+
+// Run: Find any attack path to Tier0
+run findAnyTier0Attack {
+    some attacker: Principal |
+        attacker.tier = Tier2 and
+        canReachTier0[attacker]
+} for 8 but exactly 4 Tier, exactly 2 ACEType
+
+// ============================================================================
+// Extended Verification Commands
+// ============================================================================
+
+// Check multi-hop attacks
+check NoTransitiveTier2ToTier0 for 8 but exactly 4 Tier, exactly 2 ACEType
+check NoTransitiveTier1ToTier0 for 8 but exactly 4 Tier, exactly 2 ACEType
+
+// Check ADCS attacks
+check NoADCSEscalationToTier0 for 6 but exactly 4 Tier, exactly 2 ACEType
+check NoESC1VulnerableTemplates for 6 but exactly 4 Tier, exactly 2 ACEType
+
+// Check GPO attacks
+check NoGPOEscalationToTier0 for 6 but exactly 4 Tier, exactly 2 ACEType
+check Tier0GPOsProtected for 6 but exactly 4 Tier, exactly 2 ACEType
+
+// Check complete isolation
+check CompleteTierIsolation for 8 but exactly 4 Tier, exactly 2 ACEType
+
+// ============================================================================
 // End of ADTierModel_ACL.als
 // ============================================================================

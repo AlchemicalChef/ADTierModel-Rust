@@ -57,16 +57,25 @@ VARIABLES
     credentialCache,    \* Mapping: computer -> set of cached credentials
     \* Service account properties
     serviceAccountSensitive, \* Function: ServiceAccounts -> BOOLEAN (cannot be delegated)
-    serviceAccountInteractive \* Function: ServiceAccounts -> BOOLEAN (allows interactive logon)
+    serviceAccountInteractive, \* Function: ServiceAccounts -> BOOLEAN (allows interactive logon)
+    \* ACL/Permission state (integrates with Alloy model concepts)
+    objectOwner,        \* Function: Object -> Object (owner of each AD object)
+    writeDaclRights,    \* Function: Object -> SUBSET Objects (principals with WriteDACL)
+    writeOwnerRights,   \* Function: Object -> SUBSET Objects (principals with WriteOwner)
+    genericAllRights    \* Function: Object -> SUBSET Objects (principals with GenericAll/FullControl)
 
 vars == <<tierAssignment, groupMembership, nestedGroupMembership, primaryGroup,
           tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
           activeSessions, credentialCache, serviceAccountSensitive,
-          serviceAccountInteractive>>
+          serviceAccountInteractive, objectOwner, writeDaclRights,
+          writeOwnerRights, genericAllRights>>
 
 adminVars == <<tierAssignment, groupMembership, nestedGroupMembership, primaryGroup,
                tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-               serviceAccountSensitive, serviceAccountInteractive>>
+               serviceAccountSensitive, serviceAccountInteractive, objectOwner,
+               writeDaclRights, writeOwnerRights, genericAllRights>>
+
+aclVars == <<objectOwner, writeDaclRights, writeOwnerRights, genericAllRights>>
 
 sessionVars == <<activeSessions, credentialCache>>
 
@@ -98,6 +107,11 @@ TypeInvariant ==
     \* Note: ServiceAccounts \subseteq Users is checked in ASSUME
     /\ serviceAccountSensitive \in [ServiceAccounts -> BOOLEAN]
     /\ serviceAccountInteractive \in [ServiceAccounts -> BOOLEAN]
+    \* ACL permission tracking (each object maps to set of principals with that right)
+    /\ objectOwner \in [Objects -> Objects]
+    /\ writeDaclRights \in [Objects -> SUBSET Objects]
+    /\ writeOwnerRights \in [Objects -> SUBSET Objects]
+    /\ genericAllRights \in [Objects -> SUBSET Objects]
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -312,6 +326,44 @@ ServiceAccountHardening ==
         tierAssignment[sa] \in {"Tier0", "Tier1"} =>
             serviceAccountSensitive[sa] = TRUE
 
+\* INV-11: No Lower Tier GenericAll on Tier0 Objects
+\* Non-Tier0 principals cannot have GenericAll rights on Tier0 objects
+NoLowerTierGenericAllOnTier0 ==
+    \A obj \in Objects:
+        tierAssignment[obj] = "Tier0" =>
+            \A principal \in genericAllRights[obj]:
+                tierAssignment[principal] = "Tier0"
+
+\* INV-12: No Lower Tier WriteDACL on Tier0 Objects
+\* Non-Tier0 principals cannot have WriteDACL rights on Tier0 objects
+NoLowerTierWriteDaclOnTier0 ==
+    \A obj \in Objects:
+        tierAssignment[obj] = "Tier0" =>
+            \A principal \in writeDaclRights[obj]:
+                tierAssignment[principal] = "Tier0"
+
+\* INV-13: No Lower Tier Ownership of Tier0 Objects
+\* Non-Tier0 principals cannot own Tier0 objects
+NoLowerTierOwnershipOfTier0 ==
+    \A obj \in Objects:
+        tierAssignment[obj] = "Tier0" =>
+            tierAssignment[objectOwner[obj]] = "Tier0"
+
+\* INV-14: No Lower Tier WriteOwner on Tier0 Objects
+\* Non-Tier0 principals cannot have WriteOwner rights on Tier0 objects
+NoLowerTierWriteOwnerOnTier0 ==
+    \A obj \in Objects:
+        tierAssignment[obj] = "Tier0" =>
+            \A principal \in writeOwnerRights[obj]:
+                tierAssignment[principal] = "Tier0"
+
+\* Combined ACL Safety Invariant
+ACLSafetyInvariant ==
+    /\ NoLowerTierGenericAllOnTier0
+    /\ NoLowerTierWriteDaclOnTier0
+    /\ NoLowerTierOwnershipOfTier0
+    /\ NoLowerTierWriteOwnerOnTier0
+
 \* Combined Administrative Safety Invariant
 AdminSafetyInvariant ==
     /\ TypeInvariant
@@ -333,6 +385,7 @@ SessionSafetyInvariant ==
 SafetyInvariant ==
     /\ AdminSafetyInvariant
     /\ SessionSafetyInvariant
+    /\ ACLSafetyInvariant
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -413,6 +466,11 @@ Init ==
     /\ credentialCache = [comp \in Computers |-> {}]
     /\ serviceAccountSensitive = [sa \in ServiceAccounts |-> FALSE]
     /\ serviceAccountInteractive = [sa \in ServiceAccounts |-> TRUE]
+    \* ACL state initialization - each object owns itself, no explicit rights granted
+    /\ objectOwner = [obj \in Objects |-> obj]
+    /\ writeDaclRights = [obj \in Objects |-> {}]
+    /\ writeOwnerRights = [obj \in Objects |-> {}]
+    /\ genericAllRights = [obj \in Objects |-> {}]
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -433,7 +491,7 @@ MoveObjectToTier(obj, targetTier) ==
                            {g \in @ : ~IsAdminGroup(g) \/ TierOfGroup(g) = targetTier}]
     /\ UNCHANGED <<nestedGroupMembership, primaryGroup, tier0Infrastructure,
                    gpoRestrictions, enabled, lastLogon, sessionVars,
-                   serviceAccountSensitive, serviceAccountInteractive>>
+                   serviceAccountSensitive, serviceAccountInteractive, aclVars>>
 
 \* Action: Add object to a tier group
 \* Guards ensure tier isolation is maintained (considering transitive membership)
@@ -449,7 +507,7 @@ AddToTierGroup(obj, group) ==
     /\ groupMembership' = [groupMembership EXCEPT ![obj] = @ \cup {group}]
     /\ UNCHANGED <<tierAssignment, nestedGroupMembership, primaryGroup,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive, aclVars>>
 
 \* Action: Remove object from a tier group
 RemoveFromTierGroup(obj, group) ==
@@ -457,7 +515,7 @@ RemoveFromTierGroup(obj, group) ==
     /\ groupMembership' = [groupMembership EXCEPT ![obj] = @ \ {group}]
     /\ UNCHANGED <<tierAssignment, nestedGroupMembership, primaryGroup,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive, aclVars>>
 
 \* Action: Add a group as a nested member of another group
 \* Guards prevent circular nesting
@@ -470,7 +528,7 @@ AddNestedGroupMembership(parentGroup, childGroup) ==
     /\ nestedGroupMembership' = [nestedGroupMembership EXCEPT ![parentGroup] = @ \cup {childGroup}]
     /\ UNCHANGED <<tierAssignment, groupMembership, primaryGroup,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive, aclVars>>
 
 \* Action: Remove nested group membership
 RemoveNestedGroupMembership(parentGroup, childGroup) ==
@@ -478,7 +536,7 @@ RemoveNestedGroupMembership(parentGroup, childGroup) ==
     /\ nestedGroupMembership' = [nestedGroupMembership EXCEPT ![parentGroup] = @ \ {childGroup}]
     /\ UNCHANGED <<tierAssignment, groupMembership, primaryGroup,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive, aclVars>>
 
 \* Valid primary groups include tier groups, well-known groups, and "None"
 ValidPrimaryGroups == Groups \cup {"None", "Domain Users", "Domain Computers"}
@@ -493,7 +551,7 @@ SetPrimaryGroup(obj, group) ==
     /\ primaryGroup' = [primaryGroup EXCEPT ![obj] = group]
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive, aclVars>>
 
 \* Action: Designate a computer as Tier 0 infrastructure
 \* Computer must already be in Tier 0 to be designated as critical
@@ -503,7 +561,7 @@ DesignateTier0Infrastructure(comp) ==
     /\ tier0Infrastructure' = tier0Infrastructure \cup {comp}
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive, aclVars>>
 
 \* Action: Remove Tier 0 infrastructure designation
 \* Allows demoting non-critical systems
@@ -512,7 +570,7 @@ RemoveTier0Infrastructure(comp) ==
     /\ tier0Infrastructure' = tier0Infrastructure \ {comp}
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive, aclVars>>
 
 \* Action: Disable an account
 DisableAccount(obj) ==
@@ -522,7 +580,7 @@ DisableAccount(obj) ==
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, tier0Infrastructure, gpoRestrictions,
                    lastLogon, credentialCache, serviceAccountSensitive,
-                   serviceAccountInteractive>>
+                   serviceAccountInteractive, aclVars>>
 
 \* Action: Enable an account
 EnableAccount(obj) ==
@@ -531,7 +589,7 @@ EnableAccount(obj) ==
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, tier0Infrastructure, gpoRestrictions,
                    lastLogon, sessionVars, serviceAccountSensitive,
-                   serviceAccountInteractive>>
+                   serviceAccountInteractive, aclVars>>
 
 \* Action: Harden a service account (mark as sensitive, disable interactive)
 HardenServiceAccount(sa) ==
@@ -540,7 +598,7 @@ HardenServiceAccount(sa) ==
     /\ serviceAccountInteractive' = [serviceAccountInteractive EXCEPT ![sa] = FALSE]
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, tier0Infrastructure, gpoRestrictions,
-                   enabled, lastLogon, sessionVars>>
+                   enabled, lastLogon, sessionVars, aclVars>>
 
 \* Action: Update last logon time (simulates account activity)
 UpdateLastLogon(obj, newTime) ==
@@ -550,6 +608,91 @@ UpdateLastLogon(obj, newTime) ==
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, tier0Infrastructure, gpoRestrictions,
                    enabled, sessionVars, serviceAccountSensitive,
+                   serviceAccountInteractive, aclVars>>
+
+-----------------------------------------------------------------------------
+(***************************************************************************)
+(* ACL/PERMISSION ACTIONS - Integrates with Alloy ACL model                *)
+(* These actions model DACL modifications that can lead to privilege       *)
+(* escalation if not properly guarded.                                     *)
+(***************************************************************************)
+
+\* Helper: Check if actor has permission to modify DACL of target
+CanModifyDACL(actor, target) ==
+    \/ actor \in writeDaclRights[target]
+    \/ actor \in genericAllRights[target]
+    \/ actor = objectOwner[target]
+
+\* Helper: Check if actor can take ownership of target
+CanTakeOwnership(actor, target) ==
+    \/ actor \in writeOwnerRights[target]
+    \/ actor \in genericAllRights[target]
+
+\* Action: Modify DACL - Grant a right to a grantee on a target object
+\* This models the dangerous WriteDACL abuse pattern
+ModifyDACL(actor, target, grantee, right) ==
+    /\ CanModifyDACL(actor, target)
+    /\ right \in {"WriteDACL", "WriteOwner", "GenericAll"}
+    \* Guard: Non-Tier0 actors cannot grant rights on Tier0 objects
+    /\ (tierAssignment[target] = "Tier0") => (tierAssignment[actor] = "Tier0")
+    /\ CASE right = "WriteDACL" ->
+            /\ writeDaclRights' = [writeDaclRights EXCEPT ![target] = @ \cup {grantee}]
+            /\ UNCHANGED <<writeOwnerRights, genericAllRights, objectOwner>>
+         [] right = "WriteOwner" ->
+            /\ writeOwnerRights' = [writeOwnerRights EXCEPT ![target] = @ \cup {grantee}]
+            /\ UNCHANGED <<writeDaclRights, genericAllRights, objectOwner>>
+         [] right = "GenericAll" ->
+            /\ genericAllRights' = [genericAllRights EXCEPT ![target] = @ \cup {grantee}]
+            /\ UNCHANGED <<writeDaclRights, writeOwnerRights, objectOwner>>
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
+                   primaryGroup, tier0Infrastructure, gpoRestrictions,
+                   enabled, lastLogon, sessionVars, serviceAccountSensitive,
+                   serviceAccountInteractive>>
+
+\* Action: Take Ownership - Actor takes ownership of target object
+\* Ownership grants implicit WriteDACL rights
+TakeOwnership(actor, target) ==
+    /\ CanTakeOwnership(actor, target)
+    \* Guard: Non-Tier0 actors cannot take ownership of Tier0 objects
+    /\ (tierAssignment[target] = "Tier0") => (tierAssignment[actor] = "Tier0")
+    /\ objectOwner' = [objectOwner EXCEPT ![target] = actor]
+    \* Taking ownership grants implicit WriteDACL (realistic Windows behavior)
+    /\ writeDaclRights' = [writeDaclRights EXCEPT ![target] = @ \cup {actor}]
+    /\ UNCHANGED <<writeOwnerRights, genericAllRights>>
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
+                   primaryGroup, tier0Infrastructure, gpoRestrictions,
+                   enabled, lastLogon, sessionVars, serviceAccountSensitive,
+                   serviceAccountInteractive>>
+
+\* Action: Grant Self GenericAll - Self-escalation via WriteDACL abuse
+\* This is the classic "give myself full control" attack pattern
+GrantSelfGenericAll(actor, target) ==
+    /\ CanModifyDACL(actor, target)
+    \* Guard: Non-Tier0 actors cannot self-escalate on Tier0 objects
+    /\ (tierAssignment[target] = "Tier0") => (tierAssignment[actor] = "Tier0")
+    /\ genericAllRights' = [genericAllRights EXCEPT ![target] = @ \cup {actor}]
+    /\ UNCHANGED <<writeDaclRights, writeOwnerRights, objectOwner>>
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
+                   primaryGroup, tier0Infrastructure, gpoRestrictions,
+                   enabled, lastLogon, sessionVars, serviceAccountSensitive,
+                   serviceAccountInteractive>>
+
+\* Action: Revoke a right from a principal on a target object
+RevokeRight(actor, target, principal, right) ==
+    /\ CanModifyDACL(actor, target)
+    /\ right \in {"WriteDACL", "WriteOwner", "GenericAll"}
+    /\ CASE right = "WriteDACL" ->
+            /\ writeDaclRights' = [writeDaclRights EXCEPT ![target] = @ \ {principal}]
+            /\ UNCHANGED <<writeOwnerRights, genericAllRights, objectOwner>>
+         [] right = "WriteOwner" ->
+            /\ writeOwnerRights' = [writeOwnerRights EXCEPT ![target] = @ \ {principal}]
+            /\ UNCHANGED <<writeDaclRights, genericAllRights, objectOwner>>
+         [] right = "GenericAll" ->
+            /\ genericAllRights' = [genericAllRights EXCEPT ![target] = @ \ {principal}]
+            /\ UNCHANGED <<writeDaclRights, writeOwnerRights, objectOwner>>
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
+                   primaryGroup, tier0Infrastructure, gpoRestrictions,
+                   enabled, lastLogon, sessionVars, serviceAccountSensitive,
                    serviceAccountInteractive>>
 
 -----------------------------------------------------------------------------
@@ -587,6 +730,9 @@ ClearCredentialCache(resource) ==
 (* NEXT STATE RELATION                                                     *)
 (***************************************************************************)
 
+\* Set of rights that can be granted/revoked
+Rights == {"WriteDACL", "WriteOwner", "GenericAll"}
+
 AdminNext ==
     \/ \E obj \in Objects, tier \in ActiveTiers:
         MoveObjectToTier(obj, tier)
@@ -612,6 +758,15 @@ AdminNext ==
         HardenServiceAccount(sa)
     \/ \E obj \in Users, time \in 0..365:
         UpdateLastLogon(obj, time)
+    \* ACL/Permission actions
+    \/ \E actor \in Objects, target \in Objects, grantee \in Objects, right \in Rights:
+        ModifyDACL(actor, target, grantee, right)
+    \/ \E actor \in Objects, target \in Objects:
+        TakeOwnership(actor, target)
+    \/ \E actor \in Objects, target \in Objects:
+        GrantSelfGenericAll(actor, target)
+    \/ \E actor \in Objects, target \in Objects, principal \in Objects, right \in Rights:
+        RevokeRight(actor, target, principal, right)
 
 SessionNext ==
     \/ \E user \in Users, comp \in Computers:
@@ -692,5 +847,20 @@ THEOREM Spec => []NoCircularGroupNesting
 
 \* With fairness, eventually all service accounts are hardened
 THEOREM FairSpec => EventuallyAllServiceAccountsHardened
+
+\* ACL Safety - No cross-tier permission escalation
+THEOREM Spec => []ACLSafetyInvariant
+
+\* No lower tier GenericAll on Tier0 objects
+THEOREM Spec => []NoLowerTierGenericAllOnTier0
+
+\* No lower tier WriteDACL on Tier0 objects
+THEOREM Spec => []NoLowerTierWriteDaclOnTier0
+
+\* No lower tier ownership of Tier0 objects
+THEOREM Spec => []NoLowerTierOwnershipOfTier0
+
+\* No lower tier WriteOwner on Tier0 objects
+THEOREM Spec => []NoLowerTierWriteOwnerOnTier0
 
 =============================================================================
