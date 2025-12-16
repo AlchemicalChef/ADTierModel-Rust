@@ -614,9 +614,10 @@ pub async fn create_admin_account(
     };
 
     // Generate the SAM account name with tier prefix
+    // Use unwrap_or('0') to safely handle the edge case where tier string could be empty
     let sam_account_name = match options.account_type.as_str() {
-        "admin" => format!("adm-t{}-{}", tier.to_string().chars().last().unwrap(), options.base_username),
-        "service" => format!("svc-t{}-{}", tier.to_string().chars().last().unwrap(), options.base_username),
+        "admin" => format!("adm-t{}-{}", tier.to_string().chars().last().unwrap_or('0'), options.base_username),
+        "service" => format!("svc-t{}-{}", tier.to_string().chars().last().unwrap_or('0'), options.base_username),
         _ => return Err(format!("Invalid account type: {}. Use 'admin' or 'service'", options.account_type)),
     };
 

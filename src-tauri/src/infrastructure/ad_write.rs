@@ -24,12 +24,27 @@ fn escape_powershell_string(s: &str) -> String {
 }
 
 /// Check if an OU exists
-
+///
+/// Returns Ok(true) if the OU exists, Ok(false) if it doesn't exist,
+/// and propagates other errors (permission denied, network issues, etc.)
 pub fn ou_exists(ou_dn: &str) -> AppResult<bool> {
-    // Try to open the object - if it fails, it doesn't exist
     match open_ad_object::<IADs>(ou_dn) {
         Ok(_) => Ok(true),
-        Err(_) => Ok(false),
+        Err(ref e) => {
+            // Check if this is a "not found" error vs other errors
+            let error_msg = e.to_string().to_lowercase();
+            // ADSI returns "No such object" or HRESULT 0x8007202B for missing objects
+            if error_msg.contains("no such object")
+                || error_msg.contains("8007202b")
+                || error_msg.contains("object not found")
+            {
+                Ok(false)
+            } else {
+                // Log unexpected errors and propagate them
+                tracing::warn!(ou_dn = ou_dn, error = %e, "Unexpected error checking if OU exists");
+                Err(AppError::LdapError(format!("Error checking OU existence for {}: {}", ou_dn, e)))
+            }
+        }
     }
 }
 
@@ -43,6 +58,14 @@ pub fn group_exists(group_dn: &str) -> AppResult<bool> {
 
 pub fn create_ou(parent_dn: &str, ou_name: &str, description: Option<&str>) -> AppResult<String> {
     tracing::info!(ou_name = ou_name, parent_dn = parent_dn, "Creating organizational unit");
+    // SAFETY: This unsafe block creates an OU in Active Directory via ADSI/COM.
+    // This is safe because:
+    // 1. open_ad_object ensures COM is initialized and returns a valid IADsContainer
+    // 2. BSTR values are created from valid Rust strings and live for the duration of the calls
+    // 3. IADsContainer::Create follows COM calling conventions and returns a valid IDispatch
+    // 4. The cast() to IADs is type-safe via the windows crate's interface hierarchy
+    // 5. IADs::Put and SetInfo are standard ADSI operations with proper error handling
+    // 6. All COM reference counting is handled automatically by the windows crate
     unsafe {
         let container: IADsContainer = open_ad_object(parent_dn)?;
 
@@ -97,6 +120,14 @@ pub fn create_security_group(
         scope = ?group_scope,
         "Creating security group"
     );
+    // SAFETY: This unsafe block creates a security group in Active Directory via ADSI/COM.
+    // This is safe because:
+    // 1. open_ad_object ensures COM is initialized and returns a valid IADsContainer
+    // 2. All BSTR values are created from valid Rust strings and live for the duration of calls
+    // 3. IADsContainer::Create returns a valid IDispatch which is safely cast to IADs
+    // 4. The groupType values are well-known AD constants (security group flags)
+    // 5. All IADs::Put and SetInfo operations have proper error handling
+    // 6. COM reference counting is handled automatically by the windows crate
     unsafe {
         let container: IADsContainer = open_ad_object(parent_dn)?;
 
@@ -172,6 +203,14 @@ pub fn move_ad_object(object_dn: &str, target_ou_dn: &str) -> AppResult<String> 
         target_ou = target_ou_dn,
         "Moving AD object"
     );
+    // SAFETY: This unsafe block moves an AD object between OUs via ADSI/COM.
+    // This is safe because:
+    // 1. open_ad_object ensures COM is initialized and returns valid IADs/IADsContainer interfaces
+    // 2. IADs::ADsPath returns a valid BSTR containing the object's LDAP path
+    // 3. IADsContainer::MoveHere is the standard ADSI method for moving objects
+    // 4. Empty BSTR for the new name parameter means keep the original name
+    // 5. All error conditions are properly handled and logged
+    // 6. COM reference counting is handled automatically by the windows crate
     unsafe {
         // Open the object to move
         let obj: IADs = open_ad_object(object_dn)?;
@@ -220,6 +259,14 @@ pub fn add_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
         member_dn = member_dn,
         "Adding member to group"
     );
+    // SAFETY: This unsafe block adds a member to an AD group via ADSI/COM.
+    // This is safe because:
+    // 1. open_ad_object ensures COM is initialized and returns a valid IADsGroup interface
+    // 2. The member_path BSTR is created from valid Rust strings
+    // 3. IADsGroup::Add is the standard ADSI method for adding group members
+    // 4. The LDAP:// prefix is required by ADSI for member references
+    // 5. All error conditions are properly handled and logged
+    // 6. COM reference counting is handled automatically by the windows crate
     unsafe {
         let group: IADsGroup = open_ad_object(group_dn)?;
 
@@ -254,6 +301,15 @@ pub fn create_admin_user(
     password: &str,
     enabled: bool,
 ) -> AppResult<String> {
+    // SAFETY: This unsafe block creates a user account in Active Directory via ADSI/COM.
+    // This is safe because:
+    // 1. open_ad_object ensures COM is initialized and returns a valid IADsContainer
+    // 2. All BSTR values are created from valid Rust strings
+    // 3. IADsContainer::Create returns a valid IDispatch safely cast to IADs/IADsUser
+    // 4. User attributes (sAMAccountName, userPrincipalName, etc.) are set via standard IADs::Put
+    // 5. Password is set via IADsUser::SetPassword which handles secure password transmission
+    // 6. userAccountControl flags are well-known AD constants for account state
+    // 7. All COM reference counting is handled automatically by the windows crate
     unsafe {
         let container: IADsContainer = open_ad_object(parent_dn)?;
 
@@ -349,6 +405,14 @@ pub fn remove_group_member(group_dn: &str, member_dn: &str) -> AppResult<()> {
         member_dn = member_dn,
         "Removing member from group"
     );
+    // SAFETY: This unsafe block removes a member from an AD group via ADSI/COM.
+    // This is safe because:
+    // 1. open_ad_object ensures COM is initialized and returns a valid IADsGroup interface
+    // 2. The member_path BSTR is created from valid Rust strings
+    // 3. IADsGroup::Remove is the standard ADSI method for removing group members
+    // 4. The LDAP:// prefix is required by ADSI for member references
+    // 5. All error conditions are properly handled and logged
+    // 6. COM reference counting is handled automatically by the windows crate
     unsafe {
         let group: IADsGroup = open_ad_object(group_dn)?;
 
@@ -488,6 +552,16 @@ pub fn set_ou_permissions(
     ace_type: AceType,
     flags: AceFlags,
 ) -> AppResult<()> {
+    // SAFETY: This unsafe block modifies security permissions on an AD OU via ADSI/COM.
+    // This is safe because:
+    // 1. open_ad_object ensures COM is initialized and returns valid IADs interface
+    // 2. ntSecurityDescriptor is a standard AD attribute containing the DACL
+    // 3. IADsSecurityDescriptor and IADsAccessControlList are standard ADSI interfaces
+    // 4. AccessControlEntry is created with well-known AD permission constants
+    // 5. The trustee string is passed directly to ADSI which handles name resolution
+    // 6. AceType and AceFlags use well-documented AD constants
+    // 7. Changes are committed atomically via IADs::Put followed by SetInfo
+    // 8. All COM reference counting is handled automatically by the windows crate
     unsafe {
         // Open the OU
         let obj: IADs = open_ad_object(ou_dn)?;
@@ -1040,6 +1114,15 @@ pub fn initialize_tier_model(
 
 pub fn disable_account(object_dn: &str) -> AppResult<()> {
     tracing::info!(object_dn = object_dn, "Disabling account");
+    // SAFETY: This unsafe block disables an AD account by modifying userAccountControl via ADSI/COM.
+    // This is safe because:
+    // 1. open_ad_object ensures COM is initialized and returns a valid IADs interface
+    // 2. userAccountControl is a standard AD attribute for account flags
+    // 3. The VARIANT access pattern follows COM memory layout conventions
+    // 4. ADS_UF_ACCOUNTDISABLE (0x2) is a well-documented AD flag
+    // 5. The bitwise OR preserves existing flags while adding the disable flag
+    // 6. Changes are committed atomically via SetInfo
+    // 7. COM reference counting is handled automatically by the windows crate
     unsafe {
         let obj: IADs = open_ad_object(object_dn)?;
 
@@ -1089,6 +1172,16 @@ pub fn bulk_disable_accounts(object_dns: &[String]) -> Vec<Result<String, String
 
 pub fn harden_service_account(object_dn: &str) -> AppResult<()> {
     tracing::info!(object_dn = object_dn, "Hardening service account");
+    // SAFETY: This unsafe block hardens a service account by modifying userAccountControl via ADSI/COM.
+    // This is safe because:
+    // 1. open_ad_object ensures COM is initialized and returns a valid IADs interface
+    // 2. userAccountControl is a standard AD attribute for account flags
+    // 3. The VARIANT access pattern follows COM memory layout conventions
+    // 4. ADS_UF_NOT_DELEGATED (0x100000) and ADS_UF_TRUSTED_TO_AUTH_FOR_DELEGATION (0x1000000)
+    //    are well-documented AD security flags
+    // 5. The bitwise operations correctly add/remove flags without affecting others
+    // 6. Changes are committed atomically via SetInfo
+    // 7. COM reference counting is handled automatically by the windows crate
     unsafe {
         let obj: IADs = open_ad_object(object_dn)?;
 
