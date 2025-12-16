@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, memo } from "react";
 import {
   ComputerDesktopIcon,
   UserIcon,
@@ -78,7 +78,7 @@ function formatLastLogon(lastLogon: string | null): string {
   }
 }
 
-export function TierMemberCard({ member, onRefresh, selectable = false }: TierMemberCardProps) {
+export const TierMemberCard = memo(function TierMemberCard({ member, onRefresh, selectable = false }: TierMemberCardProps) {
   const Icon = getObjectIcon(member);
   const [showMoveModal, setShowMoveModal] = useState(false);
   const [showGroupModal, setShowGroupModal] = useState(false);
@@ -247,4 +247,4 @@ export function TierMemberCard({ member, onRefresh, selectable = false }: TierMe
       />
     </>
   );
-}
+});

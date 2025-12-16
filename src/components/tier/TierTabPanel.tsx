@@ -2,11 +2,11 @@ import { useState, useMemo } from "react";
 import { useTierStore } from "../../store/tierStore";
 import { tierConfig } from "../../types/tier";
 import type { TierLevel, TierMember } from "../../types/tier";
-import { TierMemberCard } from "./TierMemberCard";
 import { TierSummaryCard } from "./TierSummaryCard";
 import { Tier0InfrastructurePanel } from "./Tier0InfrastructurePanel";
 import { SearchFilterBar } from "./SearchFilterBar";
 import { BulkActionsBar } from "./BulkActionsBar";
+import { VirtualizedMemberGrid } from "./VirtualizedMemberGrid";
 import { useQueryClient } from "@tanstack/react-query";
 
 interface TierTabPanelProps {
@@ -233,61 +233,13 @@ export function TierTabPanel({ tier }: TierTabPanelProps) {
             </div>
           )}
 
-          {/* Computers Section */}
-          {computers.length > 0 && (
-            <section>
-              <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">
-                Computers ({computers.length})
-              </h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {computers.map((member) => (
-                  <TierMemberCard
-                    key={member.distinguishedName}
-                    member={member}
-                    selectable={tier !== "Unassigned"}
-                    onRefresh={handleRefresh}
-                  />
-                ))}
-              </div>
-            </section>
-          )}
-
-          {/* Users Section */}
-          {users.length > 0 && (
-            <section>
-              <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">
-                Users & Service Accounts ({users.length})
-              </h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {users.map((member) => (
-                  <TierMemberCard
-                    key={member.distinguishedName}
-                    member={member}
-                    selectable={tier !== "Unassigned"}
-                    onRefresh={handleRefresh}
-                  />
-                ))}
-              </div>
-            </section>
-          )}
-
-          {/* Groups Section */}
-          {groups.length > 0 && (
-            <section>
-              <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">
-                Groups ({groups.length})
-              </h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {groups.map((member) => (
-                  <TierMemberCard
-                    key={member.distinguishedName}
-                    member={member}
-                    selectable={tier !== "Unassigned"}
-                    onRefresh={handleRefresh}
-                  />
-                ))}
-              </div>
-            </section>
+          {/* Virtualized Members Grid */}
+          {filteredMembers.length > 0 && (
+            <VirtualizedMemberGrid
+              members={{ computers, users, groups }}
+              tier={tier}
+              onRefresh={handleRefresh}
+            />
           )}
         </>
       )}
