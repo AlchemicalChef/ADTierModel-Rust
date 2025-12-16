@@ -12,9 +12,11 @@
 (* - Nested group memberships are properly resolved (transitive closure)   *)
 (* - Primary groups are accounted for in tier calculations                 *)
 (* - Service accounts have appropriate restrictions                        *)
+(* - Unassigned objects are tracked for compliance                         *)
+(* - Endpoint protection GPOs are properly configured                      *)
 (*                                                                         *)
-(* Version 2.0 - Added nested group membership, primary groups,            *)
-(*               service accounts, and compliance violation detection      *)
+(* Version 2.1 - Added unassigned object detection and endpoint GPOs      *)
+(*               to align with Rust implementation                         *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -57,18 +59,24 @@ VARIABLES
     credentialCache,    \* Mapping: computer -> set of cached credentials
     \* Service account properties
     serviceAccountSensitive, \* Function: ServiceAccounts -> BOOLEAN (cannot be delegated)
-    serviceAccountInteractive \* Function: ServiceAccounts -> BOOLEAN (allows interactive logon)
+    serviceAccountInteractive, \* Function: ServiceAccounts -> BOOLEAN (allows interactive logon)
+    \* Endpoint Protection GPOs (aligns with Rust endpoint_protection.rs)
+    endpointGpoLinked,  \* Function: Tier -> BOOLEAN (whether endpoint GPO is linked)
+    endpointGpoEnabled  \* Function: Tier -> BOOLEAN (whether endpoint GPO is enabled)
 
 vars == <<tierAssignment, groupMembership, nestedGroupMembership, primaryGroup,
           tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
           activeSessions, credentialCache, serviceAccountSensitive,
-          serviceAccountInteractive>>
+          serviceAccountInteractive, endpointGpoLinked, endpointGpoEnabled>>
 
 adminVars == <<tierAssignment, groupMembership, nestedGroupMembership, primaryGroup,
                tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-               serviceAccountSensitive, serviceAccountInteractive>>
+               serviceAccountSensitive, serviceAccountInteractive,
+               endpointGpoLinked, endpointGpoEnabled>>
 
 sessionVars == <<activeSessions, credentialCache>>
+
+gpoVars == <<gpoRestrictions, endpointGpoLinked, endpointGpoEnabled>>
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -98,6 +106,9 @@ TypeInvariant ==
     \* Note: ServiceAccounts \subseteq Users is checked in ASSUME
     /\ serviceAccountSensitive \in [ServiceAccounts -> BOOLEAN]
     /\ serviceAccountInteractive \in [ServiceAccounts -> BOOLEAN]
+    \* Endpoint protection GPO state
+    /\ endpointGpoLinked \in [ActiveTiers -> BOOLEAN]
+    /\ endpointGpoEnabled \in [ActiveTiers -> BOOLEAN]
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -312,6 +323,20 @@ ServiceAccountHardening ==
         tierAssignment[sa] \in {"Tier0", "Tier1"} =>
             serviceAccountSensitive[sa] = TRUE
 
+\* INV-11: Endpoint Protection GPO Configuration (aligns with Rust endpoint_protection.rs)
+\* All tiers should have endpoint protection GPOs linked and enabled
+\* Note: This is a target state invariant, not strictly required for safety
+EndpointProtectionConfigured ==
+    \A tier \in ActiveTiers:
+        endpointGpoLinked[tier] /\ endpointGpoEnabled[tier]
+
+\* INV-12: No Enabled Unassigned Objects (aligns with Rust check_unassigned_objects)
+\* Enabled objects should be assigned to a tier for proper security management
+\* Note: This is a compliance target, not a strict safety invariant
+NoEnabledUnassignedObjects ==
+    \A obj \in Objects:
+        enabled[obj] => tierAssignment[obj] /= "Unassigned"
+
 \* Combined Administrative Safety Invariant
 AdminSafetyInvariant ==
     /\ TypeInvariant
@@ -368,8 +393,39 @@ InteractiveServiceAccounts ==
         /\ tierAssignment[sa] \in {"Tier0", "Tier1"}
         /\ serviceAccountInteractive[sa]}
 
+\* INV-11: Unassigned Object Detection (aligns with Rust check_unassigned_objects)
+\* Objects not assigned to any tier represent a compliance risk
+\* Enabled objects are higher priority than disabled ones
+UnassignedObjects ==
+    {obj \in Objects : tierAssignment[obj] = "Unassigned"}
+
+\* Enabled unassigned objects are a higher severity
+EnabledUnassignedObjects ==
+    {obj \in Objects :
+        /\ tierAssignment[obj] = "Unassigned"
+        /\ enabled[obj]}
+
+\* Unassigned computers (servers/workstations not in tier OUs)
+UnassignedComputers ==
+    {comp \in Computers : tierAssignment[comp] = "Unassigned"}
+
+\* Unassigned users (accounts not in tier OUs)
+UnassignedUsers ==
+    {user \in Users : tierAssignment[user] = "Unassigned"}
+
+\* Detect tiers without endpoint protection GPO linked
+TiersWithoutEndpointProtection ==
+    {tier \in ActiveTiers : ~endpointGpoLinked[tier]}
+
+\* Detect tiers with disabled endpoint protection GPO
+TiersWithDisabledEndpointGpo ==
+    {tier \in ActiveTiers :
+        /\ endpointGpoLinked[tier]
+        /\ ~endpointGpoEnabled[tier]}
+
 \* Total compliance score (0-100, higher is better)
 \* Deducts points for various violations
+\* Aligns with Rust ComplianceStatus::calculate_score()
 ComplianceScore ==
     LET totalObjects == Cardinality(Objects)
         crossTierCount == Cardinality(CrossTierViolations)
@@ -378,13 +434,27 @@ ComplianceScore ==
         unhardenedCount == Cardinality(UnhardenedServiceAccounts)
         interactiveCount == Cardinality(InteractiveServiceAccounts)
         staleCount == Cardinality(StaleAccounts)
-        \* Weight violations by severity
-        violationPoints == (crossTierCount * 20) + (misplacedCount * 25) +
-                          (wrongTierCount * 15) + (unhardenedCount * 10) +
-                          (interactiveCount * 10) + (staleCount * 5)
+        \* Unassigned object counts (new - aligns with Rust)
+        enabledUnassignedCount == Cardinality(EnabledUnassignedObjects)
+        disabledUnassignedCount == Cardinality(UnassignedObjects) - enabledUnassignedCount
+        \* Endpoint protection violations
+        noEndpointGpoCount == Cardinality(TiersWithoutEndpointProtection)
+        disabledEndpointGpoCount == Cardinality(TiersWithDisabledEndpointGpo)
+        \* Weight violations by severity (aligns with Rust severity weights)
+        \* Critical: 10, High: 5, Medium: 2, Low: 1
+        violationPoints == (crossTierCount * 10) +      \* Critical
+                          (misplacedCount * 10) +       \* Critical (T0 infrastructure)
+                          (wrongTierCount * 2) +        \* Medium
+                          (unhardenedCount * 5) +       \* High
+                          (interactiveCount * 5) +      \* High
+                          (staleCount * 2) +            \* Medium
+                          (enabledUnassignedCount * 5) + \* High (enabled unassigned)
+                          (disabledUnassignedCount * 2) + \* Medium (disabled unassigned)
+                          (noEndpointGpoCount * 5) +    \* High (missing endpoint GPO)
+                          (disabledEndpointGpoCount * 2) \* Medium (disabled endpoint GPO)
         maxScore == 100
     IN IF totalObjects = 0 THEN 100
-       ELSE maxScore - (violationPoints * 100) \div (totalObjects * 10)
+       ELSE maxScore - (violationPoints \div 1)  \* Direct point deduction
 
 \* Compliance is perfect (no violations)
 FullCompliance ==
@@ -394,6 +464,10 @@ FullCompliance ==
     /\ UnhardenedServiceAccounts = {}
     /\ InteractiveServiceAccounts = {}
     /\ StaleAccounts = {}
+    \* Added for alignment with Rust implementation
+    /\ EnabledUnassignedObjects = {}
+    /\ TiersWithoutEndpointProtection = {}
+    /\ TiersWithDisabledEndpointGpo = {}
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -413,6 +487,9 @@ Init ==
     /\ credentialCache = [comp \in Computers |-> {}]
     /\ serviceAccountSensitive = [sa \in ServiceAccounts |-> FALSE]
     /\ serviceAccountInteractive = [sa \in ServiceAccounts |-> TRUE]
+    \* Endpoint protection GPOs start unlinked (must be configured)
+    /\ endpointGpoLinked = [t \in ActiveTiers |-> FALSE]
+    /\ endpointGpoEnabled = [t \in ActiveTiers |-> FALSE]
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -433,7 +510,8 @@ MoveObjectToTier(obj, targetTier) ==
                            {g \in @ : ~IsAdminGroup(g) \/ TierOfGroup(g) = targetTier}]
     /\ UNCHANGED <<nestedGroupMembership, primaryGroup, tier0Infrastructure,
                    gpoRestrictions, enabled, lastLogon, sessionVars,
-                   serviceAccountSensitive, serviceAccountInteractive>>
+                   serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Add object to a tier group
 \* Guards ensure tier isolation is maintained (considering transitive membership)
@@ -449,7 +527,8 @@ AddToTierGroup(obj, group) ==
     /\ groupMembership' = [groupMembership EXCEPT ![obj] = @ \cup {group}]
     /\ UNCHANGED <<tierAssignment, nestedGroupMembership, primaryGroup,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Remove object from a tier group
 RemoveFromTierGroup(obj, group) ==
@@ -457,7 +536,8 @@ RemoveFromTierGroup(obj, group) ==
     /\ groupMembership' = [groupMembership EXCEPT ![obj] = @ \ {group}]
     /\ UNCHANGED <<tierAssignment, nestedGroupMembership, primaryGroup,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Add a group as a nested member of another group
 \* Guards prevent circular nesting
@@ -470,7 +550,8 @@ AddNestedGroupMembership(parentGroup, childGroup) ==
     /\ nestedGroupMembership' = [nestedGroupMembership EXCEPT ![parentGroup] = @ \cup {childGroup}]
     /\ UNCHANGED <<tierAssignment, groupMembership, primaryGroup,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Remove nested group membership
 RemoveNestedGroupMembership(parentGroup, childGroup) ==
@@ -478,7 +559,8 @@ RemoveNestedGroupMembership(parentGroup, childGroup) ==
     /\ nestedGroupMembership' = [nestedGroupMembership EXCEPT ![parentGroup] = @ \ {childGroup}]
     /\ UNCHANGED <<tierAssignment, groupMembership, primaryGroup,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled>>
 
 \* Valid primary groups include tier groups, well-known groups, and "None"
 ValidPrimaryGroups == Groups \cup {"None", "Domain Users", "Domain Computers"}
@@ -493,7 +575,8 @@ SetPrimaryGroup(obj, group) ==
     /\ primaryGroup' = [primaryGroup EXCEPT ![obj] = group]
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Designate a computer as Tier 0 infrastructure
 \* Computer must already be in Tier 0 to be designated as critical
@@ -503,7 +586,8 @@ DesignateTier0Infrastructure(comp) ==
     /\ tier0Infrastructure' = tier0Infrastructure \cup {comp}
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Remove Tier 0 infrastructure designation
 \* Allows demoting non-critical systems
@@ -512,7 +596,8 @@ RemoveTier0Infrastructure(comp) ==
     /\ tier0Infrastructure' = tier0Infrastructure \ {comp}
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, gpoRestrictions, enabled, lastLogon,
-                   sessionVars, serviceAccountSensitive, serviceAccountInteractive>>
+                   sessionVars, serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Disable an account
 DisableAccount(obj) ==
@@ -522,7 +607,7 @@ DisableAccount(obj) ==
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, tier0Infrastructure, gpoRestrictions,
                    lastLogon, credentialCache, serviceAccountSensitive,
-                   serviceAccountInteractive>>
+                   serviceAccountInteractive, endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Enable an account
 EnableAccount(obj) ==
@@ -531,7 +616,7 @@ EnableAccount(obj) ==
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, tier0Infrastructure, gpoRestrictions,
                    lastLogon, sessionVars, serviceAccountSensitive,
-                   serviceAccountInteractive>>
+                   serviceAccountInteractive, endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Harden a service account (mark as sensitive, disable interactive)
 HardenServiceAccount(sa) ==
@@ -540,7 +625,7 @@ HardenServiceAccount(sa) ==
     /\ serviceAccountInteractive' = [serviceAccountInteractive EXCEPT ![sa] = FALSE]
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, tier0Infrastructure, gpoRestrictions,
-                   enabled, lastLogon, sessionVars>>
+                   enabled, lastLogon, sessionVars, endpointGpoLinked, endpointGpoEnabled>>
 
 \* Action: Update last logon time (simulates account activity)
 UpdateLastLogon(obj, newTime) ==
@@ -550,7 +635,58 @@ UpdateLastLogon(obj, newTime) ==
     /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
                    primaryGroup, tier0Infrastructure, gpoRestrictions,
                    enabled, sessionVars, serviceAccountSensitive,
+                   serviceAccountInteractive, endpointGpoLinked, endpointGpoEnabled>>
+
+-----------------------------------------------------------------------------
+(***************************************************************************)
+(* ENDPOINT PROTECTION GPO ACTIONS                                         *)
+(* Aligns with Rust commands/endpoint_protection.rs                        *)
+(***************************************************************************)
+
+\* Action: Link endpoint protection GPO to a tier
+\* Aligns with Rust link_endpoint_gpo command
+LinkEndpointGpo(tier) ==
+    /\ tier \in ActiveTiers
+    /\ ~endpointGpoLinked[tier]  \* Not already linked
+    /\ endpointGpoLinked' = [endpointGpoLinked EXCEPT ![tier] = TRUE]
+    /\ endpointGpoEnabled' = [endpointGpoEnabled EXCEPT ![tier] = TRUE]  \* Enabled by default
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
+                   primaryGroup, tier0Infrastructure, gpoRestrictions,
+                   enabled, lastLogon, sessionVars, serviceAccountSensitive,
                    serviceAccountInteractive>>
+
+\* Action: Unlink endpoint protection GPO from a tier
+UnlinkEndpointGpo(tier) ==
+    /\ tier \in ActiveTiers
+    /\ endpointGpoLinked[tier]
+    /\ endpointGpoLinked' = [endpointGpoLinked EXCEPT ![tier] = FALSE]
+    /\ endpointGpoEnabled' = [endpointGpoEnabled EXCEPT ![tier] = FALSE]
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
+                   primaryGroup, tier0Infrastructure, gpoRestrictions,
+                   enabled, lastLogon, sessionVars, serviceAccountSensitive,
+                   serviceAccountInteractive>>
+
+\* Action: Enable an already-linked endpoint protection GPO
+EnableEndpointGpo(tier) ==
+    /\ tier \in ActiveTiers
+    /\ endpointGpoLinked[tier]
+    /\ ~endpointGpoEnabled[tier]
+    /\ endpointGpoEnabled' = [endpointGpoEnabled EXCEPT ![tier] = TRUE]
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
+                   primaryGroup, tier0Infrastructure, gpoRestrictions,
+                   enabled, lastLogon, sessionVars, serviceAccountSensitive,
+                   serviceAccountInteractive, endpointGpoLinked>>
+
+\* Action: Disable an endpoint protection GPO (keeps it linked but not applied)
+DisableEndpointGpo(tier) ==
+    /\ tier \in ActiveTiers
+    /\ endpointGpoLinked[tier]
+    /\ endpointGpoEnabled[tier]
+    /\ endpointGpoEnabled' = [endpointGpoEnabled EXCEPT ![tier] = FALSE]
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership,
+                   primaryGroup, tier0Infrastructure, gpoRestrictions,
+                   enabled, lastLogon, sessionVars, serviceAccountSensitive,
+                   serviceAccountInteractive, endpointGpoLinked>>
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -567,20 +703,29 @@ Logon(account, resource) ==
     /\ activeSessions' = activeSessions \cup {<<account, resource>>}
     \* Credentials get cached on the resource (realistic Windows behavior)
     /\ credentialCache' = [credentialCache EXCEPT ![resource] = @ \cup {account}]
-    /\ UNCHANGED adminVars
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership, primaryGroup,
+                   tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
+                   serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled>>
 
 \* Logoff: account logs off from a resource
 Logoff(account, resource) ==
     /\ <<account, resource>> \in activeSessions
     /\ activeSessions' = activeSessions \ {<<account, resource>>}
     \* Note: Credentials may remain cached even after logoff (mimikatz risk)
-    /\ UNCHANGED <<adminVars, credentialCache>>
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership, primaryGroup,
+                   tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
+                   serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled, credentialCache>>
 
 \* Clear credential cache (e.g., via reboot or security tool)
 ClearCredentialCache(resource) ==
     /\ resource \in Computers
     /\ credentialCache' = [credentialCache EXCEPT ![resource] = {}]
-    /\ UNCHANGED <<adminVars, activeSessions>>
+    /\ UNCHANGED <<tierAssignment, groupMembership, nestedGroupMembership, primaryGroup,
+                   tier0Infrastructure, gpoRestrictions, enabled, lastLogon,
+                   serviceAccountSensitive, serviceAccountInteractive,
+                   endpointGpoLinked, endpointGpoEnabled, activeSessions>>
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -612,6 +757,15 @@ AdminNext ==
         HardenServiceAccount(sa)
     \/ \E obj \in Users, time \in 0..365:
         UpdateLastLogon(obj, time)
+    \* Endpoint protection GPO actions
+    \/ \E tier \in ActiveTiers:
+        LinkEndpointGpo(tier)
+    \/ \E tier \in ActiveTiers:
+        UnlinkEndpointGpo(tier)
+    \/ \E tier \in ActiveTiers:
+        EnableEndpointGpo(tier)
+    \/ \E tier \in ActiveTiers:
+        DisableEndpointGpo(tier)
 
 SessionNext ==
     \/ \E user \in Users, comp \in Computers:
@@ -692,5 +846,11 @@ THEOREM Spec => []NoCircularGroupNesting
 
 \* With fairness, eventually all service accounts are hardened
 THEOREM FairSpec => EventuallyAllServiceAccountsHardened
+
+\* With fairness, eventually all endpoint protection GPOs are configured
+THEOREM FairSpec => <>[]EndpointProtectionConfigured
+
+\* With fairness, eventually all objects are assigned to tiers
+THEOREM FairSpec => <>[]NoEnabledUnassignedObjects
 
 =============================================================================

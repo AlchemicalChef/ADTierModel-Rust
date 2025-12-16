@@ -1156,7 +1156,73 @@ VC-5: Repair reduces violation count
 
 ---
 
-## 11. Model Checking Properties
+## 11. TLA+ and Alloy Formal Specifications
+
+The `specs/` directory contains formal specifications that can be verified using model checkers:
+
+### 11.1 TLA+ Specification (`specs/ADTierModel.tla`)
+
+The TLA+ specification models the state machine of the tier model with:
+
+**State Variables:**
+- `tierAssignment` - Object tier assignments
+- `groupMembership` - Direct group membership
+- `nestedGroupMembership` - Nested group relationships
+- `primaryGroup` - Primary group assignments
+- `tier0Infrastructure` - Critical infrastructure designations
+- `gpoRestrictions` - GPO deny policies
+- `endpointGpoLinked` - Endpoint protection GPO link status
+- `endpointGpoEnabled` - Endpoint protection GPO enabled status
+- `serviceAccountSensitive` - Service account hardening flags
+- `activeSessions` / `credentialCache` - Runtime security state
+
+**Key Invariants:**
+- `TierIsolation` - No user has admin rights in multiple tiers
+- `Tier0InfrastructurePlacement` - Critical infrastructure in Tier 0
+- `GpoRestrictionsValid` - Cross-tier logon restrictions configured
+- `ObjectTierConsistency` - Object memberships match tier assignments
+- `NoCircularGroupNesting` - No cycles in nested group membership
+- `ServiceAccountHardening` - Privileged service accounts are hardened
+- `EndpointProtectionConfigured` - Endpoint GPOs are linked and enabled
+- `NoEnabledUnassignedObjects` - Enabled objects assigned to tiers
+
+**Compliance Violations Detected:**
+- `CrossTierViolations` - Users with admin access in multiple tiers
+- `MisplacedTier0Infrastructure` - Critical systems not in Tier 0
+- `WrongTierPlacement` - Objects with conflicting group memberships
+- `UnassignedObjects` - Objects not assigned to any tier
+- `EnabledUnassignedObjects` - Enabled objects without tier assignment
+- `TiersWithoutEndpointProtection` - Missing endpoint GPOs
+- `UnhardenedServiceAccounts` - Service accounts without hardening
+
+Run the model checker:
+```bash
+cd specs
+tlc ADTierModel.tla -config ADTierModel.cfg
+```
+
+### 11.2 Alloy Specification (`specs/ADTierModel_ACL.als`)
+
+The Alloy specification models attack paths and ACL-based security:
+
+**Attack Path Predicates:**
+- `canModifyDACL` - WriteDACL permission abuse
+- `canTakeOwnership` - WriteOwner permission abuse
+- `canModifyGroupMembership` - Group membership modification
+- `hasDCSyncRights` - Domain replication privilege abuse
+- `canConfigureRBCD` - Resource-based delegation attacks
+- `canSetSPN` - Kerberoasting setup detection
+
+**Security Assertions:**
+- `NoTier2ToTier0Path` - No privilege escalation from Tier 2 to Tier 0
+- `TierIsolationMaintained` - Cross-tier access prevented
+- `ProtectedGroupsSecure` - Admin groups protected from modification
+
+Run the Alloy Analyzer to check assertions and find counterexamples.
+
+---
+
+## 12. Model Checking Properties
 
 These properties can be verified using model checkers like TLA+, SPIN, or NuSMV:
 
@@ -1198,7 +1264,7 @@ Spec ==
 
 ---
 
-## 12. Conclusion
+## 13. Conclusion
 
 This formal model provides:
 
@@ -1212,5 +1278,13 @@ This formal model provides:
 8. **Security analysis** with threat model and guarantees
 9. **Verification conditions** for correctness proofs
 10. **Model checking specifications** for automated verification
+11. **TLA+ specification** in `specs/ADTierModel.tla` for state machine verification
+12. **Alloy specification** in `specs/ADTierModel_ACL.als` for attack path analysis
 
 The model demonstrates that the ADTierModel, when properly configured, provides strong security guarantees against credential theft and privilege escalation attacks in Active Directory environments.
+
+### Version History
+
+- **v2.1** - Added unassigned object detection, endpoint protection GPO modeling, and alignment with Rust implementation
+- **v2.0** - Added nested group membership, primary groups, service accounts, and compliance violation detection
+- **v1.0** - Initial formal specification
