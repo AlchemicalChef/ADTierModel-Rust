@@ -1,4 +1,0 @@
-Microsoft Windows [Version 10.0.20348.4529]
-(c) Microsoft Corporation. All rights reserved.
-
-C:\Users\Administrator\Desktop\ADTierModel-Rust>
