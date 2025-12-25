@@ -2,7 +2,7 @@
 
 A desktop application for managing Microsoft Active Directory tiered administrative models, built with Tauri, Rust, and React.
 
-#AI/LLM Usage
+# AI/LLM Usage
 Claude did the UI, no one wants to see a UI that I would design. Trust me. 
 
 I was pretty open about it on X, but I realize I didn't do the disclosure here. 
