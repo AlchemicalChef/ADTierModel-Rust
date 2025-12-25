@@ -8,12 +8,15 @@ AD Tier Model Manager implements a tiered administrative model for Active Direct
 
 ## Features
 
-- **Tier Management**: View and manage objects across Tier 0, Tier 1, and Tier 2
+- **Tier Management**: View and manage objects across Tier 0, Tier 1, Tier 2, and Unassigned
+- **Virtualized UI**: Handle thousands of AD objects with smooth scrolling (tested with 6,000+ objects)
 - **GPO Configuration**: Automatically configure Group Policy Objects for tier isolation
-- **Compliance Monitoring**: Detect cross-tier access violations and compliance issues
+- **Compliance Monitoring**: Detect cross-tier access violations, unassigned objects, stale accounts, and more
 - **User Rights Assignments**: Enforce logon restrictions between tiers
+- **Bulk Operations**: Select and move multiple objects between tiers
 - **Health Checks**: Monitor AD infrastructure health
-- **Audit Logging**: Track administrative actions
+- **Audit Logging**: Track administrative actions with exportable reports
+- **Dark Mode**: Full dark mode support
 
 ## Tier Structure
 
@@ -58,12 +61,17 @@ The application enforces tier isolation through GPO-based user rights assignment
 
 ### Build from Source
 
-```bash
-# Prerequisites
-# - Node.js 18+
-# - Rust 1.70+
-# - Visual Studio Build Tools
+#### Prerequisites
 
+- **Node.js 18+** - [Download](https://nodejs.org/)
+- **Rust 1.70+** - [Download](https://rustup.rs/)
+- **Visual Studio Build Tools 2022** - Required for Windows MSVC toolchain
+  - Install with "Desktop development with C++" workload
+  - Or run: `winget install Microsoft.VisualStudio.2022.BuildTools`
+
+#### Build Steps
+
+```powershell
 # Clone the repository
 git clone https://github.com/yourusername/ADTierModel-Rust.git
 cd ADTierModel-Rust
@@ -71,12 +79,19 @@ cd ADTierModel-Rust
 # Install dependencies
 npm install
 
-# Development mode
+# Development mode (with hot reload)
 npm run tauri dev
 
 # Production build
 npm run tauri build
 ```
+
+#### Build Outputs
+
+After a successful build, installers are located at:
+- **MSI**: `src-tauri/target/release/bundle/msi/AD Tier Model_1.0.0_x64_en-US.msi`
+- **NSIS**: `src-tauri/target/release/bundle/nsis/AD Tier Model_1.0.0_x64-setup.exe`
+- **Standalone**: `src-tauri/target/release/ad-tier-model.exe`
 
 ## Usage
 
@@ -97,11 +112,14 @@ Navigate to **Settings > GPO Management** to:
 
 ### Compliance Monitoring
 
-The **Compliance** tab displays:
-- Cross-tier access violations
-- Stale accounts
-- Service accounts with interactive logon capability
-- Objects in wrong tier OUs
+The **Compliance** tab displays a compliance score (0-100) and detects:
+- **Cross-tier access violations** - Users with group membership in multiple tiers (Critical)
+- **Unassigned objects** - Computers, users, and groups not assigned to any tier (High)
+- **Stale accounts** - Accounts that haven't logged in for 90+ days (Medium)
+- **Service account vulnerabilities** - Service accounts not marked as sensitive (High)
+- **Wrong tier placement** - Objects with group membership conflicting with their OU location
+
+Bulk remediation actions are available for stale accounts and service account hardening.
 
 ## Project Structure
 
@@ -125,10 +143,12 @@ ADTierModel-Rust/
 
 ## Technology Stack
 
-- **Frontend**: React, TypeScript, Tailwind CSS, Headless UI
+- **Frontend**: React 18, TypeScript, Tailwind CSS, Headless UI
+- **State Management**: Zustand, TanStack Query
+- **Virtualization**: TanStack Virtual (for large dataset rendering)
 - **Backend**: Rust, Tauri 2.x
 - **AD Integration**: Windows ADSI (via windows-rs crate)
-- **GPO Management**: PowerShell (Group Policy and Active Directory modules)
+- **GPO Management**: Native Windows API via windows-rs
 
 ## License
 

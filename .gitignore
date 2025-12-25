@@ -80,3 +80,19 @@ debug/
 
 # Claude Code
 .claude/
+
+# Build scripts (development/debugging)
+build-final.cmd
+build-release.bat
+build-tauri.ps1
+build-tauri2.ps1
+build.bat
+run-build.ps1
+run-npm.ps1
+verify.ps1
+*.ps1
+*.cmd
+*.bat
+
+# Build output files
+build-output*.txt

@@ -82,6 +82,18 @@ pub fn ldap_search(
         scope = ?scope,
         "LDAP SEARCH: Starting query"
     );
+    // SAFETY: This unsafe block performs LDAP searches against Active Directory via ADSI/COM.
+    // This is safe because:
+    // 1. COM is initialized via ensure_com_initialized() before any ADSI calls
+    // 2. path_bstr is a valid BSTR created from a valid Rust string
+    // 3. ADsOpenObject returns a valid IDirectorySearch interface or an error
+    // 4. Search preferences use well-known ADS_SEARCHPREF constants
+    // 5. All BSTR values for attributes are created from valid Rust strings
+    // 6. ExecuteSearch, GetFirstRow, GetNextRow follow ADSI search patterns
+    // 7. GetColumn and FreeColumn properly manage column memory per ADSI contract
+    // 8. CloseSearchHandle releases the search handle when done
+    // 9. All COM reference counting is handled automatically by the windows crate
+    // 10. Memory for ADS_SEARCH_COLUMN is managed via std::mem::zeroed and FreeColumn
     unsafe {
         // Initialize COM - use APARTMENTTHREADED for ADSI compatibility
         ensure_com_initialized()?;
@@ -138,7 +150,9 @@ pub fn ldap_search(
             },
         ];
 
-        search.SetSearchPreference(prefs.as_mut_ptr(), prefs.len() as u32).ok();
+        if let Err(e) = search.SetSearchPreference(prefs.as_mut_ptr(), prefs.len() as u32) {
+            tracing::warn!(error = %e, "Failed to set search preferences, continuing with defaults");
+        }
 
         // Build attribute list
         let attr_bstrs: Vec<BSTR> = attributes.iter().map(|a| BSTR::from(*a)).collect();
@@ -212,14 +226,18 @@ pub fn ldap_search(
                     if !values.is_empty() {
                         result.attributes.insert(attr.to_lowercase(), values);
                     }
-                    search.FreeColumn(&mut column).ok();
+                    if let Err(e) = search.FreeColumn(&mut column) {
+                        tracing::warn!(attr = attr, error = %e, "Failed to free LDAP column");
+                    }
                 }
             }
 
             results.push(result);
         }
 
-        search.CloseSearchHandle(search_handle).ok();
+        if let Err(e) = search.CloseSearchHandle(search_handle) {
+            tracing::warn!(error = %e, "Failed to close LDAP search handle");
+        }
         tracing::info!(
             base_dn = base_dn,
             result_count = results.len(),
@@ -1373,6 +1391,17 @@ pub fn test_ad_connection(domain_dn: &str) -> AdDiagnostics {
         tier_ou_status: Vec::new(),
     };
 
+    // SAFETY: This unsafe block performs diagnostic LDAP operations against Active Directory via ADSI/COM.
+    // This is safe because:
+    // 1. CoInitializeEx safely initializes COM for this thread (handles already-initialized case)
+    // 2. ADsOpenObject binds to LDAP using secure authentication with current credentials
+    // 3. path_bstr is a valid BSTR created from domain_dn string
+    // 4. IDirectorySearch interface is properly obtained via COM QueryInterface
+    // 5. ExecuteSearch, GetFirstRow use standard ADSI search patterns
+    // 6. CloseSearchHandle releases the search handle when done
+    // 7. All error conditions are captured in the diagnostics struct for reporting
+    // 8. This is a read-only diagnostic function - no modifications are made
+    // 9. COM reference counting is handled automatically by the windows crate
     unsafe {
         // Step 1: Initialize COM
         diagnostics.steps_completed.push("Attempting COM initialization...".to_string());
@@ -1529,7 +1558,9 @@ pub fn test_ad_connection(domain_dn: &str) -> AdDiagnostics {
                     break;
                 }
 
-                let _ = search.CloseSearchHandle(handle);
+                if let Err(e) = search.CloseSearchHandle(handle) {
+                    tracing::warn!(error = %e, "Failed to close diagnostic search handle");
+                }
 
                 diagnostics.objects_found = count;
                 diagnostics.ldap_search_status = format!("OK - found {} object(s)", count);

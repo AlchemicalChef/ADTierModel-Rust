@@ -601,6 +601,130 @@ pub fn check_wrong_tier_placement(domain_dn: &str) -> Result<Vec<ComplianceViola
     Ok(violations)
 }
 
+/// Check for objects not assigned to any tier
+/// Returns violations for unassigned computers and users which should be tiered
+pub fn check_unassigned_objects(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
+    use crate::domain::ObjectType;
+    use crate::infrastructure::ad_search::get_tier_objects;
+
+    let unassigned = get_tier_objects(domain_dn, None)
+        .map_err(|e| format!("Failed to get unassigned objects: {:?}", e))?;
+
+    let mut violations = Vec::new();
+
+    // Count by type
+    let mut computer_count = 0usize;
+    let mut user_count = 0usize;
+    let mut group_count = 0usize;
+    let mut enabled_computers: Vec<_> = Vec::new();
+    let mut enabled_users: Vec<_> = Vec::new();
+
+    for member in &unassigned {
+        match member.object_type {
+            ObjectType::Computer | ObjectType::AdminWorkstation => {
+                computer_count += 1;
+                if member.enabled {
+                    enabled_computers.push(member);
+                }
+            }
+            ObjectType::User | ObjectType::ServiceAccount => {
+                user_count += 1;
+                if member.enabled {
+                    enabled_users.push(member);
+                }
+            }
+            ObjectType::Group => {
+                group_count += 1;
+            }
+        }
+    }
+
+    let total = computer_count + user_count + group_count;
+
+    // Only flag if there are unassigned objects
+    if total > 0 {
+        // Create a summary violation
+        let description = format!(
+            "{} unassigned objects not in any tier: {} computers, {} users, {} groups",
+            total, computer_count, user_count, group_count
+        );
+
+        violations.push(ComplianceViolation {
+            violation_type: ViolationType::UnassignedObject,
+            severity: if enabled_computers.len() + enabled_users.len() > 100 {
+                ViolationSeverity::Critical  // Many enabled unassigned objects is critical
+            } else if total > 50 {
+                ViolationSeverity::High
+            } else {
+                ViolationSeverity::Medium
+            },
+            object_name: format!("Unassigned Objects ({})", total),
+            object_dn: domain_dn.to_string(),
+            sam_account_name: "N/A".to_string(),
+            description,
+            tiers_involved: vec![],
+            remediation: format!(
+                "Assign objects to appropriate tiers. {} enabled computers and {} enabled users need immediate attention.",
+                enabled_computers.len(), enabled_users.len()
+            ),
+        });
+
+        // Add individual violations for enabled computers (limit to first 20 to avoid spam)
+        for (i, computer) in enabled_computers.iter().take(20).enumerate() {
+            violations.push(ComplianceViolation {
+                violation_type: ViolationType::UnassignedObject,
+                severity: ViolationSeverity::High,
+                object_name: computer.name.clone(),
+                object_dn: computer.distinguished_name.clone(),
+                sam_account_name: computer.sam_account_name.clone(),
+                description: format!(
+                    "Enabled computer not assigned to any tier{}",
+                    if i == 19 && enabled_computers.len() > 20 {
+                        format!(" (+{} more)", enabled_computers.len() - 20)
+                    } else {
+                        String::new()
+                    }
+                ),
+                tiers_involved: vec![],
+                remediation: "Move this computer to an appropriate tier OU (Tier1 for servers, Tier2 for workstations)".to_string(),
+            });
+        }
+
+        // Add individual violations for enabled users (limit to first 10)
+        for (i, user) in enabled_users.iter().take(10).enumerate() {
+            violations.push(ComplianceViolation {
+                violation_type: ViolationType::UnassignedObject,
+                severity: ViolationSeverity::High,
+                object_name: user.name.clone(),
+                object_dn: user.distinguished_name.clone(),
+                sam_account_name: user.sam_account_name.clone(),
+                description: format!(
+                    "Enabled user not assigned to any tier{}",
+                    if i == 9 && enabled_users.len() > 10 {
+                        format!(" (+{} more)", enabled_users.len() - 10)
+                    } else {
+                        String::new()
+                    }
+                ),
+                tiers_involved: vec![],
+                remediation: "Assign this user to an appropriate tier based on their role and access requirements".to_string(),
+            });
+        }
+    }
+
+    tracing::info!(
+        total = total,
+        computers = computer_count,
+        users = user_count,
+        groups = group_count,
+        enabled_computers = enabled_computers.len(),
+        enabled_users = enabled_users.len(),
+        "Unassigned objects check completed"
+    );
+
+    Ok(violations)
+}
+
 /// Get full compliance status
 ///
 /// # Arguments
@@ -650,6 +774,12 @@ pub fn get_compliance_status(domain_dn: &str, stale_threshold_days: u32) -> Resu
     // Check wrong tier placement
     let placement_violations = check_wrong_tier_placement(domain_dn)?;
     for violation in placement_violations {
+        status.add_violation(violation);
+    }
+
+    // Check for unassigned objects (not in any tier)
+    let unassigned_violations = check_unassigned_objects(domain_dn)?;
+    for violation in unassigned_violations {
         status.add_violation(violation);
     }
 

@@ -21,6 +21,8 @@ pub enum ViolationType {
     StaleAccount,
     /// Service account with interactive logon
     ServiceAccountInteractiveLogon,
+    /// Object not assigned to any tier
+    UnassignedObject,
 }
 
 impl ViolationType {
@@ -32,6 +34,7 @@ impl ViolationType {
             ViolationType::MissingGroupMembership => ViolationSeverity::Low,
             ViolationType::StaleAccount => ViolationSeverity::Medium,
             ViolationType::ServiceAccountInteractiveLogon => ViolationSeverity::High,
+            ViolationType::UnassignedObject => ViolationSeverity::High,
         }
     }
 
@@ -43,6 +46,7 @@ impl ViolationType {
             ViolationType::MissingGroupMembership => "Object missing required tier group membership",
             ViolationType::StaleAccount => "Account has not logged in for extended period",
             ViolationType::ServiceAccountInteractiveLogon => "Service account capable of interactive logon",
+            ViolationType::UnassignedObject => "Object not assigned to any tier in the AD tiering model",
         }
     }
 }

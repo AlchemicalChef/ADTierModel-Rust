@@ -123,7 +123,8 @@ export type ViolationType =
   | "wrongTierPlacement"
   | "missingGroupMembership"
   | "staleAccount"
-  | "serviceAccountInteractiveLogon";
+  | "serviceAccountInteractiveLogon"
+  | "unassignedObject";
 
 export type ViolationSeverity = "critical" | "high" | "medium" | "low";
 

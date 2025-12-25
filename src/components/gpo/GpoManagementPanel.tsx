@@ -383,9 +383,9 @@ export function GpoManagementPanel() {
                 Linked: {result.gposLinked.join(", ")}
               </p>
             )}
-            {result.restrictionsApplied && (
+            {result.gposConfigured.length > 0 && (
               <p className="text-green-600 dark:text-green-400">
-                User rights restrictions applied
+                Configured: {result.gposConfigured.join(", ")}
               </p>
             )}
             {result.errors.length > 0 && (

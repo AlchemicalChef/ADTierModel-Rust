@@ -31,6 +31,16 @@ impl AdConnection {
 
     pub fn connect() -> AppResult<Self> {
         tracing::info!("Attempting to connect to Active Directory");
+        // SAFETY: This unsafe block performs Windows ADSI operations to connect to Active Directory.
+        // This is safe because:
+        // 1. COM is initialized via ensure_com_initialized() before any ADSI calls
+        // 2. root_dse_path is a valid BSTR created from a static string literal
+        // 3. ADsOpenObject is called with valid parameters per MSDN documentation
+        // 4. We pass null for username/password to use current Windows credentials
+        // 5. ADS_SECURE_AUTHENTICATION ensures proper authentication
+        // 6. The IADs interface pointer is properly managed via Option<IADs>
+        // 7. All subsequent helper calls (get_ads_property, get_netbios_name) maintain safety invariants
+        // 8. COM reference counting is handled by the windows crate's Drop implementation
         unsafe {
             // Initialize COM using centralized helper
             tracing::debug!("Initializing COM");
@@ -202,18 +212,26 @@ impl AdConnection {
                             let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
                             let slice = std::slice::from_raw_parts(ptr, len);
                             let result = String::from_utf16_lossy(slice);
-                            search.FreeColumn(&mut column).ok();
-                            search.CloseSearchHandle(search_handle).ok();
+                            if let Err(e) = search.FreeColumn(&mut column) {
+                                tracing::warn!(error = %e, "Failed to free LDAP column during NetBIOS lookup");
+                            }
+                            if let Err(e) = search.CloseSearchHandle(search_handle) {
+                                tracing::warn!(error = %e, "Failed to close search handle during NetBIOS lookup");
+                            }
                             tracing::debug!("Found NetBIOS name: {}", result);
                             return Ok(result);
                         }
                     }
                 }
-                search.FreeColumn(&mut column).ok();
+                if let Err(e) = search.FreeColumn(&mut column) {
+                    tracing::warn!(error = %e, "Failed to free LDAP column during NetBIOS search");
+                }
             }
         }
 
-        search.CloseSearchHandle(search_handle).ok();
+        if let Err(e) = search.CloseSearchHandle(search_handle) {
+            tracing::warn!(error = %e, "Failed to close search handle during NetBIOS lookup");
+        }
         tracing::warn!("NetBIOS name not found in configuration partition");
         Err(AppError::LdapError("NetBIOS name not found".to_string()))
     }
@@ -231,6 +249,13 @@ impl AdConnection {
 impl Drop for AdConnection {
     fn drop(&mut self) {
         if self._com_initialized {
+            // SAFETY: CoUninitialize is called to balance the CoInitializeEx call made during connect().
+            // This is safe because:
+            // 1. We only call CoUninitialize if _com_initialized is true (indicating we successfully initialized COM)
+            // 2. CoUninitialize is idempotent and safe to call when COM was initialized on this thread
+            // 3. This is called during drop, so no further COM operations will be attempted on this connection
+            // 4. The windows crate ensures all COM interface pointers are released before this point
+            // Note: CoUninitialize doesn't return an error that we can meaningfully handle in drop()
             unsafe {
                 CoUninitialize();
             }
