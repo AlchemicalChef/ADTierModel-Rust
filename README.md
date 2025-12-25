@@ -9,6 +9,7 @@ AD Tier Model Manager implements a tiered administrative model for Active Direct
 ## Features
 
 - **Tier Management**: View and manage objects across Tier 0, Tier 1, Tier 2, and Unassigned
+- **ACL Analysis**: Check ACLs 
 - **Virtualized UI**: Handle thousands of AD objects with smooth scrolling (tested with 6,000+ objects)
 - **GPO Configuration**: Automatically configure Group Policy Objects for tier isolation
 - **Compliance Monitoring**: Detect cross-tier access violations, unassigned objects, stale accounts, and more
