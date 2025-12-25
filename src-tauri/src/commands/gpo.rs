@@ -2,29 +2,9 @@
 
 use crate::domain::Tier;
 use crate::infrastructure::{
-    AdConnection, GpoConfigResult, TierGpoStatus,
+    GpoConfigResult, TierGpoStatus, get_domain_dn,
     get_all_gpo_status, configure_tier_gpos, configure_all_tier_gpos, delete_tier_gpos,
 };
-use once_cell::sync::Lazy;
-use std::sync::Mutex;
-
-static AD_CONNECTION: Lazy<Mutex<Option<AdConnection>>> = Lazy::new(|| Mutex::new(None));
-
-fn get_domain_dn() -> Result<String, String> {
-    let mut conn = AD_CONNECTION.lock().map_err(|e| format!("Lock error: {}", e))?;
-
-    if conn.is_none() {
-        match AdConnection::connect() {
-            Ok(c) => *conn = Some(c),
-            Err(e) => return Err(format!("Failed to connect to AD: {}", e)),
-        }
-    }
-
-    match conn.as_ref() {
-        Some(c) => Ok(c.domain_dn.clone()),
-        None => Err("Not connected to Active Directory".to_string()),
-    }
-}
 
 /// Get the GPO status for all tiers
 #[tauri::command]

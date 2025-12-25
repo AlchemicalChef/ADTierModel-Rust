@@ -38,6 +38,11 @@ pub enum Tier0RoleType {
     RIDMaster,
     PDCEmulator,
     InfrastructureMaster,
+    // Additional Tier 0 Infrastructure (MITRE ATT&CK: T1072, T1068)
+    /// SCCM/MECM Site Server - has code execution on all managed systems
+    SCCM,
+    /// Exchange Server - Exchange Trusted Subsystem has WriteDacl on domain
+    Exchange,
 }
 
 impl Tier0RoleType {
@@ -53,6 +58,8 @@ impl Tier0RoleType {
             Tier0RoleType::RIDMaster => "RID Master",
             Tier0RoleType::PDCEmulator => "PDC Emulator",
             Tier0RoleType::InfrastructureMaster => "Infrastructure Master",
+            Tier0RoleType::SCCM => "SCCM/MECM Site Server",
+            Tier0RoleType::Exchange => "Exchange Server",
         }
     }
 
@@ -64,6 +71,14 @@ impl Tier0RoleType {
                 | Tier0RoleType::RIDMaster
                 | Tier0RoleType::PDCEmulator
                 | Tier0RoleType::InfrastructureMaster
+        )
+    }
+
+    /// Check if this role type has direct code execution capability on managed systems
+    pub fn has_code_execution_capability(&self) -> bool {
+        matches!(
+            self,
+            Tier0RoleType::SCCM | Tier0RoleType::Exchange
         )
     }
 }

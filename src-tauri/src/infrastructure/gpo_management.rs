@@ -270,10 +270,24 @@ pub fn get_tier_admin_group(tier: Tier) -> String {
 }
 
 /// Get the groups that should be denied for a tier
+///
+/// CRITICAL SECURITY: This function enforces tier isolation by denying logon rights.
+/// It MUST include both custom tier groups AND built-in privileged groups to prevent
+/// credential exposure attacks (MITRE ATT&CK T1078, T1003).
 fn get_deny_groups_for_tier(tier: Tier, logon_type: &str) -> Vec<String> {
+    // Built-in privileged groups that should ALWAYS be denied from lower tiers
+    // These groups have domain-wide admin rights and must not be exposed to credential theft
+    let builtin_privileged_groups = vec![
+        "Domain Admins".to_string(),
+        "Enterprise Admins".to_string(),
+        "Schema Admins".to_string(),
+        "Administrators".to_string(),  // BUILTIN\Administrators
+    ];
+
     match tier {
         Tier::Tier0 => {
             // Tier 0: Deny Tier1 and Tier2 admins (lower tiers can't access Tier 0)
+            // Note: Built-in groups ARE allowed on Tier 0 as they are Tier 0 principals
             vec![
                 "Tier1-Admins".to_string(),
                 "Tier1-Operators".to_string(),
@@ -282,24 +296,36 @@ fn get_deny_groups_for_tier(tier: Tier, logon_type: &str) -> Vec<String> {
             ]
         }
         Tier::Tier1 => {
-            // Tier 1: Deny Tier0 (higher tier) and Tier2 (lower tier)
+            // Tier 1: Deny Tier0 (higher tier), Tier2 (lower tier), AND built-in privileged groups
+            // Built-in privileged groups must be denied to prevent credential harvesting
             match logon_type {
-                "local" | "rdp" | "network" => vec![
-                    "Tier0-Admins".to_string(),
-                    "Tier2-Admins".to_string(),
-                    "Tier2-Operators".to_string(),
-                ],
+                "local" | "rdp" | "network" => {
+                    let mut groups = builtin_privileged_groups.clone();
+                    groups.extend(vec![
+                        "Tier0-Admins".to_string(),
+                        "Tier0-Operators".to_string(),  // Added: was missing from deny list
+                        "Tier2-Admins".to_string(),
+                        "Tier2-Operators".to_string(),
+                    ]);
+                    groups
+                }
                 _ => vec![],
             }
         }
         Tier::Tier2 => {
-            // Tier 2: Deny Tier0 and Tier1 (higher tiers can't access Tier 2)
+            // Tier 2: Deny Tier0, Tier1 (higher tiers), AND built-in privileged groups
+            // This is the most critical - Tier 2 (workstations) are most exposed to attack
             match logon_type {
-                "local" | "rdp" | "network" => vec![
-                    "Tier0-Admins".to_string(),
-                    "Tier1-Admins".to_string(),
-                    "Tier1-Operators".to_string(),
-                ],
+                "local" | "rdp" | "network" => {
+                    let mut groups = builtin_privileged_groups.clone();
+                    groups.extend(vec![
+                        "Tier0-Admins".to_string(),
+                        "Tier0-Operators".to_string(),  // Added: was missing from deny list
+                        "Tier1-Admins".to_string(),
+                        "Tier1-Operators".to_string(),
+                    ]);
+                    groups
+                }
                 _ => vec![],
             }
         }

@@ -410,12 +410,21 @@ fn detect_tier0_role(result: &SearchResult, dn: &str) -> Option<Tier0RoleType> {
         return Some(Tier0RoleType::DomainController);
     }
 
-    // Check SPNs for ADFS
+    // Check SPNs for various Tier 0 services
     if let Some(spns) = result.get_all("serviceprincipalname") {
         for spn in spns {
             let spn_lower = spn.to_lowercase();
+            // ADFS
             if spn_lower.contains("http/sts") || spn_lower.contains("http/adfs") {
                 return Some(Tier0RoleType::ADFS);
+            }
+            // SCCM/MECM - has code execution on all managed systems
+            if spn_lower.contains("sms") || spn_lower.contains("sccm") {
+                return Some(Tier0RoleType::SCCM);
+            }
+            // Exchange - Exchange Trusted Subsystem has WriteDacl on domain
+            if spn_lower.contains("exchangemdb") || spn_lower.contains("exchangeab") || spn_lower.contains("exchangerfr") {
+                return Some(Tier0RoleType::Exchange);
             }
         }
     }
@@ -810,6 +819,120 @@ pub fn discover_tier0_infrastructure(domain_dn: &str) -> AppResult<Vec<Tier0Comp
         }
     }
 
+    // 6. SCCM/MECM Site Servers (CRITICAL - have code execution on all managed systems)
+    // MITRE ATT&CK: T1072 (Software Deployment Tools)
+    let sccm_results = match ldap_search(
+        domain_dn,
+        "(&(objectClass=computer)(|(servicePrincipalName=*SMS*)(servicePrincipalName=*sms*)(servicePrincipalName=*SCCM*)(servicePrincipalName=*sccm*)))",
+        &[
+            "name",
+            "distinguishedName",
+            "operatingSystem",
+            "lastLogonTimestamp",
+            "description",
+            "servicePrincipalName",
+        ],
+        SearchScope::Subtree,
+    ) {
+        Ok(results) => {
+            tracing::debug!(count = results.len(), "Found SCCM/MECM servers");
+            results
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query SCCM servers - continuing");
+            Vec::new()
+        }
+    };
+
+    for result in sccm_results {
+        let name = result.get("name").cloned().unwrap_or_default();
+        let dn = result.get("distinguishedname").cloned().unwrap_or_default();
+        let os = result.get("operatingsystem").cloned();
+        let last_logon_raw = result.get("lastlogontimestamp")
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|ft| filetime_to_iso8601(ft));
+        let description = result.get("description").cloned();
+
+        // Extract current OU from DN
+        let current_ou = dn
+            .split(',')
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Avoid duplicates
+        if !components.iter().any(|c| c.distinguished_name == dn) {
+            let is_in_tier0 = Tier::from_dn(&dn) == Some(Tier::Tier0);
+            components.push(Tier0Component {
+                name,
+                role_type: Tier0RoleType::SCCM,
+                operating_system: os,
+                last_logon: last_logon_raw,
+                current_ou,
+                is_in_tier0,
+                distinguished_name: dn,
+                description,
+            });
+        }
+    }
+
+    // 7. Exchange Servers (CRITICAL - Exchange Trusted Subsystem has WriteDacl on domain)
+    // MITRE ATT&CK: T1003.001, T1068
+    let exchange_results = match ldap_search(
+        domain_dn,
+        "(&(objectClass=computer)(|(servicePrincipalName=*exchangeMDB*)(servicePrincipalName=*exchangeAB*)(servicePrincipalName=*exchangeRFR*)(servicePrincipalName=*SMTP*)))",
+        &[
+            "name",
+            "distinguishedName",
+            "operatingSystem",
+            "lastLogonTimestamp",
+            "description",
+            "servicePrincipalName",
+        ],
+        SearchScope::Subtree,
+    ) {
+        Ok(results) => {
+            tracing::debug!(count = results.len(), "Found Exchange servers");
+            results
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query Exchange servers - continuing");
+            Vec::new()
+        }
+    };
+
+    for result in exchange_results {
+        let name = result.get("name").cloned().unwrap_or_default();
+        let dn = result.get("distinguishedname").cloned().unwrap_or_default();
+        let os = result.get("operatingsystem").cloned();
+        let last_logon_raw = result.get("lastlogontimestamp")
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|ft| filetime_to_iso8601(ft));
+        let description = result.get("description").cloned();
+
+        // Extract current OU from DN
+        let current_ou = dn
+            .split(',')
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Avoid duplicates
+        if !components.iter().any(|c| c.distinguished_name == dn) {
+            let is_in_tier0 = Tier::from_dn(&dn) == Some(Tier::Tier0);
+            components.push(Tier0Component {
+                name,
+                role_type: Tier0RoleType::Exchange,
+                operating_system: os,
+                last_logon: last_logon_raw,
+                current_ou,
+                is_in_tier0,
+                distinguished_name: dn,
+                description,
+            });
+        }
+    }
+
     tracing::info!(
         total_components = components.len(),
         "Tier 0 infrastructure discovery complete"
@@ -912,7 +1035,9 @@ fn resolve_primary_group(domain_dn: &str, rid_str: &str) -> Option<String> {
     };
 
     // Well-known RIDs - these are standard across all AD domains
+    // Includes AdminSDHolder-protected groups per Microsoft documentation
     let group_name = match rid {
+        // Domain groups
         512 => "Domain Admins",
         513 => "Domain Users",
         514 => "Domain Guests",
@@ -924,6 +1049,16 @@ fn resolve_primary_group(domain_dn: &str, rid_str: &str) -> Option<String> {
         520 => "Group Policy Creator Owners",
         521 => "Read-only Domain Controllers",
         522 => "Cloneable Domain Controllers",
+        // AdminSDHolder-protected operator groups (CRITICAL for security)
+        548 => "Account Operators",
+        549 => "Server Operators",
+        550 => "Print Operators",
+        551 => "Backup Operators",
+        552 => "Replicators",
+        // Key management groups (Windows Server 2016+)
+        526 => "Key Admins",
+        527 => "Enterprise Key Admins",
+        // Other well-known groups
         553 => "RAS and IAS Servers",
         571 => "Allowed RODC Password Replication Group",
         572 => "Denied RODC Password Replication Group",

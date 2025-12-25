@@ -8,50 +8,10 @@ use crate::domain::{
     SubOU, Tier, Tier0Component, TierCounts, TierMember,
 };
 use crate::infrastructure::{
-    AdConnection, add_group_member, check_initialization_status, create_admin_user,
-    discover_tier0_infrastructure, get_tier_objects, initialize_tier_model, move_ad_object,
-    remove_group_member, test_ad_connection, AdDiagnostics,
+    add_group_member, check_initialization_status, clear_connection, create_admin_user,
+    discover_tier0_infrastructure, get_connection, get_tier_objects, initialize_tier_model,
+    move_ad_object, remove_group_member, test_ad_connection, AdDiagnostics,
 };
-use once_cell::sync::Lazy;
-use std::sync::Mutex;
-
-/// Cached AD connection
-static AD_CONNECTION: Lazy<Mutex<Option<AdConnection>>> = Lazy::new(|| Mutex::new(None));
-
-/// Get or create AD connection
-fn get_connection() -> Result<std::sync::MutexGuard<'static, Option<AdConnection>>, String> {
-    // First check if connection already exists (fast path)
-    {
-        let conn = AD_CONNECTION.lock().map_err(|e| {
-            tracing::error!(error = %e, "Failed to acquire AD connection lock");
-            format!("Lock error: {}", e)
-        })?;
-        if conn.is_some() {
-            return Ok(conn);
-        }
-    } // Lock released here - don't hold during slow connect
-
-    // Connect without holding the lock to avoid blocking other threads
-    tracing::debug!("No existing AD connection, attempting to connect");
-    let new_conn = AdConnection::connect().map_err(|e| {
-        tracing::error!(error = %e, "Failed to connect to AD");
-        format!("Failed to connect to AD: {}", e)
-    })?;
-    tracing::info!("AD connection established");
-
-    // Re-acquire lock and store connection
-    let mut conn = AD_CONNECTION.lock().map_err(|e| {
-        tracing::error!(error = %e, "Failed to acquire AD connection lock");
-        format!("Lock error: {}", e)
-    })?;
-
-    // Check if another thread connected while we were connecting
-    if conn.is_none() {
-        *conn = Some(new_conn);
-    }
-
-    Ok(conn)
-}
 
 /// Get domain connection info
 #[tauri::command]
@@ -66,37 +26,55 @@ pub async fn get_domain_info() -> Result<DomainInfo, String> {
 /// Diagnose AD connection - returns detailed diagnostic info for debugging
 #[tauri::command]
 pub async fn diagnose_ad_connection() -> Result<AdDiagnostics, String> {
+    use crate::infrastructure::AdConnection;
+
     // First try to get the domain DN from existing connection
     let domain_dn = {
-        let conn = AD_CONNECTION.lock().map_err(|e| format!("Lock error: {}", e))?;
-        match conn.as_ref() {
-            Some(c) => c.domain_dn.clone(),
-            None => {
-                // Try to establish connection first to get domain DN
-                drop(conn);
-                match AdConnection::connect() {
-                    Ok(c) => {
-                        let dn = c.domain_dn.clone();
-                        let mut conn = AD_CONNECTION.lock().map_err(|e| format!("Lock error: {}", e))?;
-                        *conn = Some(c);
-                        dn
-                    }
-                    Err(e) => {
-                        // Can't connect, try to discover domain DN another way
-                        // Return diagnostics showing the connection failure
-                        return Ok(AdDiagnostics {
-                            domain_dn: "Unknown - connection failed".to_string(),
-                            com_init_status: "Not tested".to_string(),
-                            ldap_bind_status: "Not tested".to_string(),
-                            ldap_search_status: "Not tested".to_string(),
-                            objects_found: 0,
-                            error_code: None,
-                            error_message: Some(format!("Initial connection failed: {}", e)),
-                            steps_completed: vec![format!("AdConnection::connect() failed: {}", e)],
-                            tier_ou_status: Vec::new(),
-                        });
+        let conn = get_connection();
+        match conn {
+            Ok(guard) => match guard.as_ref() {
+                Some(c) => c.domain_dn.clone(),
+                None => {
+                    // Try to establish connection first to get domain DN
+                    drop(guard);
+                    match AdConnection::connect() {
+                        Ok(c) => {
+                            let dn = c.domain_dn.clone();
+                            if let Ok(mut conn) = get_connection() {
+                                *conn = Some(c);
+                            }
+                            dn
+                        }
+                        Err(e) => {
+                            // Can't connect, try to discover domain DN another way
+                            // Return diagnostics showing the connection failure
+                            return Ok(AdDiagnostics {
+                                domain_dn: "Unknown - connection failed".to_string(),
+                                com_init_status: "Not tested".to_string(),
+                                ldap_bind_status: "Not tested".to_string(),
+                                ldap_search_status: "Not tested".to_string(),
+                                objects_found: 0,
+                                error_code: None,
+                                error_message: Some(format!("Initial connection failed: {}", e)),
+                                steps_completed: vec![format!("AdConnection::connect() failed: {}", e)],
+                                tier_ou_status: Vec::new(),
+                            });
+                        }
                     }
                 }
+            },
+            Err(e) => {
+                return Ok(AdDiagnostics {
+                    domain_dn: "Unknown - connection error".to_string(),
+                    com_init_status: "Not tested".to_string(),
+                    ldap_bind_status: "Not tested".to_string(),
+                    ldap_search_status: "Not tested".to_string(),
+                    objects_found: 0,
+                    error_code: None,
+                    error_message: Some(format!("Connection error: {}", e)),
+                    steps_completed: vec![format!("get_connection() failed: {}", e)],
+                    tier_ou_status: Vec::new(),
+                });
             }
         }
     };
@@ -236,19 +214,19 @@ pub async fn get_tier0_infrastructure() -> Result<Vec<Tier0Component>, String> {
 /// Force reconnection to AD
 #[tauri::command]
 pub async fn reconnect_ad() -> Result<DomainInfo, String> {
+    use crate::infrastructure::AdConnection;
+
     tracing::info!("Command: reconnect_ad - Forcing AD reconnection");
-    let mut conn = AD_CONNECTION.lock().map_err(|e| {
-        tracing::error!(error = %e, "Failed to acquire lock for reconnection");
-        format!("Lock error: {}", e)
-    })?;
-    *conn = None; // Clear existing connection
+    clear_connection();
     tracing::debug!("Cleared existing AD connection");
 
     match AdConnection::connect() {
         Ok(c) => {
             let info = c.get_domain_info();
             tracing::info!(domain = info.dns_root.as_str(), "AD reconnection successful");
-            *conn = Some(c);
+            if let Ok(mut conn) = get_connection() {
+                *conn = Some(c);
+            }
             Ok(info)
         }
         Err(e) => {

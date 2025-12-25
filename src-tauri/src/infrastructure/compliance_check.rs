@@ -10,6 +10,42 @@ use crate::infrastructure::ad_connection::AdConnection;
 use crate::infrastructure::ad_search::{ldap_search, SearchScope, escape_ldap_filter, LDAP_MATCHING_RULE_IN_CHAIN};
 use std::collections::HashSet;
 
+// ============================================================================
+// BUILT-IN PRIVILEGED GROUPS
+// These groups have domain-wide admin rights and are protected by AdminSDHolder.
+// Members are implicitly Tier 0 principals regardless of OU placement.
+// ============================================================================
+
+/// Well-known built-in privileged group names (AdminSDHolder-protected)
+pub const BUILTIN_PRIVILEGED_GROUPS: &[&str] = &[
+    "Domain Admins",
+    "Enterprise Admins",
+    "Schema Admins",
+    "Administrators",
+    "Account Operators",
+    "Server Operators",
+    "Print Operators",
+    "Backup Operators",
+    "Replicators",
+    "Key Admins",
+    "Enterprise Key Admins",
+];
+
+/// Well-known built-in privileged group RIDs
+pub const BUILTIN_PRIVILEGED_RIDS: &[u32] = &[
+    512,  // Domain Admins
+    518,  // Schema Admins
+    519,  // Enterprise Admins
+    544,  // Administrators (BUILTIN)
+    548,  // Account Operators
+    549,  // Server Operators
+    550,  // Print Operators
+    551,  // Backup Operators
+    552,  // Replicators
+    526,  // Key Admins
+    527,  // Enterprise Key Admins
+];
+
 /// Get the domain DN for compliance checks
 
 pub fn get_domain_dn() -> Result<String, String> {
@@ -204,6 +240,812 @@ pub fn is_service_account_hardened(object_dn: &str) -> Result<bool, String> {
     Ok(false)
 }
 
+// ============================================================================
+// ADMINSDHOLDER DETECTION
+// AdminSDHolder is a security mechanism that protects privileged accounts.
+// Objects with adminCount=1 have their ACLs reset hourly by SDProp.
+// ============================================================================
+
+/// Check if an object is protected by AdminSDHolder (has adminCount=1).
+///
+/// AdminSDHolder protection is applied to members of protected groups. The SDProp
+/// process resets the ACL of these objects every 60 minutes based on the AdminSDHolder
+/// object's ACL. This is a critical security mechanism but can cause issues if
+/// accounts have adminCount=1 but are no longer in protected groups (orphaned).
+///
+/// # Arguments
+/// * `object_dn` - Distinguished name of the object to check
+///
+/// # Returns
+/// * `Ok(Some(true))` - Object has adminCount=1 (protected)
+/// * `Ok(Some(false))` - Object has adminCount=0 or not set (not protected)
+/// * `Ok(None)` - Could not determine (object not found or attribute missing)
+/// * `Err(String)` - Query failed
+pub fn check_admin_count(object_dn: &str) -> Result<Option<bool>, String> {
+    let results = ldap_search(
+        object_dn,
+        "(objectClass=*)",
+        &["adminCount"],
+        SearchScope::Base,
+    ).map_err(|e| format!("Failed to query adminCount: {:?}", e))?;
+
+    if let Some(result) = results.first() {
+        if let Some(admin_count_str) = result.get("admincount") {
+            let admin_count: i32 = admin_count_str.parse().unwrap_or(0);
+            return Ok(Some(admin_count == 1));
+        }
+        // Attribute exists but is empty or not set
+        return Ok(Some(false));
+    }
+
+    Ok(None)
+}
+
+/// Find all objects with adminCount=1 (AdminSDHolder-protected objects).
+///
+/// This is useful for security auditing to identify:
+/// 1. Legitimate protected accounts (members of protected groups)
+/// 2. Orphaned protected accounts (adminCount=1 but no longer in protected groups)
+///
+/// # Arguments
+/// * `domain_dn` - Domain distinguished name
+///
+/// # Returns
+/// * Vector of objects with adminCount=1, including their DN and sAMAccountName
+pub fn find_admin_count_objects(domain_dn: &str) -> Result<Vec<std::collections::HashMap<String, String>>, String> {
+    use crate::infrastructure::ad_search::SearchResult;
+
+    // Search for all objects with adminCount=1
+    let filter = "(adminCount=1)";
+
+    let results: Vec<SearchResult> = ldap_search(
+        domain_dn,
+        filter,
+        &["name", "sAMAccountName", "distinguishedName", "objectClass", "memberOf"],
+        SearchScope::Subtree,
+    ).map_err(|e| format!("Failed to find adminCount objects: {:?}", e))?;
+
+    // Convert SearchResult to HashMap<String, String> (flatten multi-value to first value)
+    let hash_maps: Vec<std::collections::HashMap<String, String>> = results
+        .into_iter()
+        .map(|sr| {
+            sr.attributes
+                .into_iter()
+                .map(|(k, v)| (k, v.into_iter().next().unwrap_or_default()))
+                .collect()
+        })
+        .collect();
+
+    Ok(hash_maps)
+}
+
+/// Check for AdminSDHolder compliance violations.
+///
+/// Detects:
+/// 1. Orphaned adminCount - Objects with adminCount=1 but not in any protected group
+/// 2. Protected group members in lower tiers - High-privilege accounts in Tier 1/2
+///
+/// # Arguments
+/// * `domain_dn` - Domain distinguished name
+///
+/// # Returns
+/// * Vector of compliance violations related to AdminSDHolder
+pub fn check_admin_sdholder_violations(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
+    let mut violations = Vec::new();
+
+    // Find all objects with adminCount=1
+    let admin_count_objects = find_admin_count_objects(domain_dn)?;
+
+    tracing::info!(
+        count = admin_count_objects.len(),
+        "Found objects with adminCount=1"
+    );
+
+    for obj in admin_count_objects {
+        let name = obj.get("name").cloned().unwrap_or_default();
+        let sam = obj.get("samaccountname").cloned().unwrap_or_default();
+        let dn = obj.get("distinguishedname").cloned().unwrap_or_default();
+        let object_classes = obj.get("objectclass").cloned().unwrap_or_default();
+
+        // Skip computer accounts (DCs and other protected computers are expected)
+        if object_classes.to_lowercase().contains("computer") {
+            continue;
+        }
+
+        // Check if object is in a tier OU (Tier0 is expected, Tier1/2 is a violation)
+        let object_tier = Tier::from_dn(&dn);
+
+        match object_tier {
+            Some(Tier::Tier0) => {
+                // Expected - protected accounts should be in Tier 0
+                continue;
+            }
+            Some(tier) => {
+                // Violation: Protected account in lower tier
+                violations.push(ComplianceViolation {
+                    violation_type: ViolationType::MisplacedTier0Infrastructure,
+                    severity: ViolationSeverity::Critical,
+                    object_name: name,
+                    object_dn: dn,
+                    sam_account_name: sam,
+                    description: format!(
+                        "AdminSDHolder-protected account (adminCount=1) found in {:?}. \
+                         Protected accounts are Tier 0 principals and should not be in lower tiers.",
+                        tier
+                    ),
+                    tiers_involved: vec![Tier::Tier0, tier],
+                    remediation: "Move this account to Tier 0 or remove from protected groups and clear adminCount".to_string(),
+                });
+            }
+            None => {
+                // Object not in any tier OU - check if it's a potential orphan
+                // For now, just log it; orphaned adminCount is a lesser concern
+                tracing::debug!(
+                    name = name,
+                    dn = dn,
+                    "AdminSDHolder-protected object not in tier OU"
+                );
+            }
+        }
+    }
+
+    Ok(violations)
+}
+
+/// Check if a user is a member of any built-in privileged group.
+///
+/// Uses LDAP_MATCHING_RULE_IN_CHAIN for transitive membership checking.
+///
+/// # Arguments
+/// * `user_dn` - Distinguished name of the user
+/// * `domain_dn` - Domain distinguished name
+///
+/// # Returns
+/// * Vector of built-in privileged group names the user is a member of
+pub fn get_builtin_group_memberships(user_dn: &str, domain_dn: &str) -> Result<Vec<String>, String> {
+    let mut memberships = Vec::new();
+
+    for group_name in BUILTIN_PRIVILEGED_GROUPS {
+        // Find the group DN
+        let group_filter = format!(
+            "(&(objectClass=group)(sAMAccountName={}))",
+            escape_ldap_filter(group_name)
+        );
+
+        let group_results = ldap_search(
+            domain_dn,
+            &group_filter,
+            &["distinguishedName"],
+            SearchScope::Subtree,
+        ).unwrap_or_default();
+
+        if let Some(group_result) = group_results.first() {
+            if let Some(group_dn) = group_result.get("distinguishedname") {
+                // Check if user is member (transitively)
+                let member_filter = format!(
+                    "(&(distinguishedName={})(memberOf:{}:={}))",
+                    escape_ldap_filter(user_dn),
+                    LDAP_MATCHING_RULE_IN_CHAIN,
+                    escape_ldap_filter(group_dn)
+                );
+
+                if let Ok(member_results) = ldap_search(
+                    domain_dn,
+                    &member_filter,
+                    &["distinguishedName"],
+                    SearchScope::Subtree,
+                ) {
+                    if !member_results.is_empty() {
+                        memberships.push(group_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(memberships)
+}
+
+// ============================================================================
+// KERBEROS DELEGATION ATTACK PATH DETECTION
+// MITRE ATT&CK: T1558.001, T1558.003, T1558.004, T1134.002
+// ============================================================================
+
+/// userAccountControl flag for unconstrained delegation
+const TRUSTED_FOR_DELEGATION: u32 = 0x80000; // 524288
+
+/// Check for Kerberos delegation vulnerabilities that bypass tier isolation.
+///
+/// Detects:
+/// 1. Unconstrained Delegation (TRUSTED_FOR_DELEGATION) - CRITICAL
+///    Allows capture of TGTs from any authenticating user
+/// 2. Constrained Delegation (msDS-AllowedToDelegateTo) - HIGH
+///    Can be abused for S4U2Self/S4U2Proxy attacks
+/// 3. Resource-Based Constrained Delegation (msDS-AllowedToActOnBehalfOfOtherIdentity) - CRITICAL
+///    Any principal with write access can configure delegation to themselves
+///
+/// # Arguments
+/// * `domain_dn` - Domain distinguished name
+///
+/// # Returns
+/// * Vector of compliance violations for delegation issues
+pub fn check_delegation_violations(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
+    let mut violations = Vec::new();
+
+    // =========================================================================
+    // 1. UNCONSTRAINED DELEGATION (CRITICAL)
+    // Computers/users with TRUSTED_FOR_DELEGATION can capture TGTs
+    // Filter excludes Domain Controllers (they have this legitimately)
+    // =========================================================================
+    let unconstrained_filter = format!(
+        "(&(userAccountControl:1.2.840.113556.1.4.803:={})(!(userAccountControl:1.2.840.113556.1.4.803:=8192)))",
+        TRUSTED_FOR_DELEGATION
+    );
+
+    let unconstrained_results = ldap_search(
+        domain_dn,
+        &unconstrained_filter,
+        &["name", "sAMAccountName", "distinguishedName", "objectClass", "userAccountControl"],
+        SearchScope::Subtree,
+    ).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "Failed to query unconstrained delegation");
+        Vec::new()
+    });
+
+    for result in &unconstrained_results {
+        let name = result.get("name").cloned().unwrap_or_default();
+        let sam = result.get("samaccountname").cloned().unwrap_or_default();
+        let dn = result.get("distinguishedname").cloned().unwrap_or_default();
+        let object_class = result.get("objectclass").cloned().unwrap_or_default();
+
+        // Determine object tier
+        let object_tier = Tier::from_dn(&dn);
+
+        violations.push(ComplianceViolation {
+            violation_type: ViolationType::UnconstrainedDelegation,
+            severity: ViolationSeverity::Critical,
+            object_name: name,
+            object_dn: dn,
+            sam_account_name: sam,
+            description: format!(
+                "Unconstrained delegation enabled (TRUSTED_FOR_DELEGATION). \
+                 Any user authenticating to this {} can have their TGT captured and reused.",
+                if object_class.to_lowercase().contains("computer") { "computer" } else { "account" }
+            ),
+            tiers_involved: object_tier.map(|t| vec![t]).unwrap_or_default(),
+            remediation: "Remove unconstrained delegation. Use constrained delegation with protocol transition if needed. \
+                         For Tier 0, consider Protected Users group membership.".to_string(),
+        });
+    }
+
+    // =========================================================================
+    // 2. CONSTRAINED DELEGATION (HIGH)
+    // Accounts with msDS-AllowedToDelegateTo can impersonate users to specific services
+    // =========================================================================
+    let constrained_filter = "(msDS-AllowedToDelegateTo=*)";
+
+    let constrained_results = ldap_search(
+        domain_dn,
+        constrained_filter,
+        &["name", "sAMAccountName", "distinguishedName", "msDS-AllowedToDelegateTo", "userAccountControl"],
+        SearchScope::Subtree,
+    ).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "Failed to query constrained delegation");
+        Vec::new()
+    });
+
+    for result in &constrained_results {
+        let name = result.get("name").cloned().unwrap_or_default();
+        let sam = result.get("samaccountname").cloned().unwrap_or_default();
+        let dn = result.get("distinguishedname").cloned().unwrap_or_default();
+        let delegate_to = result.get("msds-allowedtodelegateto").cloned().unwrap_or_default();
+        let uac: u32 = result.get("useraccountcontrol")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        // Check if protocol transition is enabled (more dangerous)
+        let has_protocol_transition = (uac & 0x1000000) != 0; // TRUSTED_TO_AUTH_FOR_DELEGATION
+
+        let object_tier = Tier::from_dn(&dn);
+
+        // Only flag as violation if not a Domain Controller or if targeting Tier 0 services
+        let is_tier0_target = delegate_to.to_lowercase().contains("dc=") ||
+                              delegate_to.to_lowercase().contains("ldap/") ||
+                              delegate_to.to_lowercase().contains("cifs/") && delegate_to.to_lowercase().contains("dc");
+
+        violations.push(ComplianceViolation {
+            violation_type: ViolationType::ConstrainedDelegation,
+            severity: if is_tier0_target || has_protocol_transition {
+                ViolationSeverity::Critical
+            } else {
+                ViolationSeverity::High
+            },
+            object_name: name,
+            object_dn: dn,
+            sam_account_name: sam,
+            description: format!(
+                "Constrained delegation to: {}{}. {}",
+                delegate_to,
+                if has_protocol_transition { " (with protocol transition - S4U2Self enabled)" } else { "" },
+                if is_tier0_target { "TARGETS TIER 0 SERVICES!" } else { "" }
+            ),
+            tiers_involved: object_tier.map(|t| vec![t]).unwrap_or_default(),
+            remediation: "Review delegation targets. Remove if not required. \
+                         Ensure delegation targets are within the same tier.".to_string(),
+        });
+    }
+
+    // =========================================================================
+    // 3. RESOURCE-BASED CONSTRAINED DELEGATION (RBCD) (CRITICAL)
+    // Any principal with write access to a computer can configure RBCD to themselves
+    // =========================================================================
+    let rbcd_filter = "(msDS-AllowedToActOnBehalfOfOtherIdentity=*)";
+
+    let rbcd_results = ldap_search(
+        domain_dn,
+        rbcd_filter,
+        &["name", "sAMAccountName", "distinguishedName", "msDS-AllowedToActOnBehalfOfOtherIdentity"],
+        SearchScope::Subtree,
+    ).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "Failed to query RBCD");
+        Vec::new()
+    });
+
+    for result in &rbcd_results {
+        let name = result.get("name").cloned().unwrap_or_default();
+        let sam = result.get("samaccountname").cloned().unwrap_or_default();
+        let dn = result.get("distinguishedname").cloned().unwrap_or_default();
+
+        let object_tier = Tier::from_dn(&dn);
+        let is_tier0 = object_tier == Some(Tier::Tier0);
+
+        violations.push(ComplianceViolation {
+            violation_type: ViolationType::ResourceBasedConstrainedDelegation,
+            severity: ViolationSeverity::Critical,
+            object_name: name,
+            object_dn: dn,
+            sam_account_name: sam,
+            description: format!(
+                "Resource-Based Constrained Delegation configured. \
+                 {}Principals in the RBCD list can impersonate any user to services on this computer.",
+                if is_tier0 { "THIS IS A TIER 0 SYSTEM! " } else { "" }
+            ),
+            tiers_involved: object_tier.map(|t| vec![t]).unwrap_or_default(),
+            remediation: "Clear msDS-AllowedToActOnBehalfOfOtherIdentity unless explicitly required. \
+                         Audit who has write access to this computer object.".to_string(),
+        });
+    }
+
+    tracing::info!(
+        unconstrained = unconstrained_results.len(),
+        constrained = constrained_results.len(),
+        rbcd = rbcd_results.len(),
+        "Delegation violation check completed"
+    );
+
+    Ok(violations)
+}
+
+// ============================================================================
+// ACL-BASED ATTACK PATH DETECTION (SHADOW ADMINS)
+// MITRE ATT&CK: T1222.001, T1078.002
+// ============================================================================
+
+/// Dangerous ACL rights that grant effective control over AD objects
+/// These map to BloodHound-style attack edges
+const DANGEROUS_ACL_RIGHTS: &[&str] = &[
+    "GenericAll",           // Full control
+    "GenericWrite",         // Write all properties
+    "WriteDacl",            // Modify ACL
+    "WriteOwner",           // Take ownership
+    "WriteProperty",        // Write specific properties (can include dangerous ones)
+    "ExtendedRight",        // Includes ForceChangePassword, DS-Replication-Get-Changes
+    "Self",                 // Validated writes (can add self to group)
+];
+
+/// Well-known Tier 0 object paths that should be protected
+const TIER0_PROTECTED_OBJECTS: &[&str] = &[
+    "CN=Administrators,CN=Builtin",
+    "CN=Domain Admins,CN=Users",
+    "CN=Enterprise Admins,CN=Users",
+    "CN=Schema Admins,CN=Users",
+    "CN=Domain Controllers,CN=Users",
+    "CN=AdminSDHolder,CN=System",
+];
+
+/// Check for ACL-based attack paths (Shadow Admins)
+///
+/// Detects non-Tier0 principals with dangerous permissions on Tier 0 objects:
+/// - GenericAll: Full control
+/// - WriteDacl: Can modify ACL to grant themselves more access
+/// - WriteOwner: Can take ownership and then modify ACL
+/// - ForceChangePassword: Can reset passwords of Tier 0 accounts
+///
+/// This is a simplified implementation that checks for common shadow admin paths.
+/// A full implementation would require parsing nTSecurityDescriptor binary data.
+///
+/// # Arguments
+/// * `domain_dn` - Domain distinguished name
+///
+/// # Returns
+/// * Vector of compliance violations for shadow admin paths
+pub fn check_dangerous_acl_permissions(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
+    let mut violations = Vec::new();
+
+    // =========================================================================
+    // CHECK 1: Accounts with DCSync rights
+    // DS-Replication-Get-Changes and DS-Replication-Get-Changes-All
+    // These are typically granted on the domain head
+    // =========================================================================
+
+    // Find accounts with adminCount=1 that are NOT in expected Tier 0 groups
+    // These could be shadow admins with delegated permissions
+    let admin_count_objects = find_admin_count_objects(domain_dn)?;
+
+    for obj in &admin_count_objects {
+        let name = obj.get("name").cloned().unwrap_or_default();
+        let sam = obj.get("samaccountname").cloned().unwrap_or_default();
+        let dn = obj.get("distinguishedname").cloned().unwrap_or_default();
+        let object_class = obj.get("objectclass").cloned().unwrap_or_default();
+
+        // Skip built-in accounts that should have adminCount
+        if sam.to_lowercase() == "administrator" ||
+           sam.to_lowercase() == "krbtgt" ||
+           object_class.to_lowercase().contains("computer") {
+            continue;
+        }
+
+        // Check if this account is in standard Tier 0 admin groups
+        let builtin_memberships = get_builtin_group_memberships(&dn, domain_dn)
+            .unwrap_or_default();
+
+        // Check custom tier group memberships
+        let tier0_admin_tiers = get_member_admin_tiers(&dn, domain_dn)
+            .unwrap_or_default();
+
+        // If account has adminCount=1 but is NOT in any known admin group,
+        // it likely has delegated permissions (shadow admin)
+        if builtin_memberships.is_empty() && !tier0_admin_tiers.contains(&Tier::Tier0) {
+            violations.push(ComplianceViolation {
+                violation_type: ViolationType::DangerousAclPermission,
+                severity: ViolationSeverity::Critical,
+                object_name: name,
+                object_dn: dn,
+                sam_account_name: sam,
+                description: "Account has adminCount=1 but is not a member of any known admin group. \
+                             Likely has delegated permissions (Shadow Admin) via direct ACL grants.".to_string(),
+                tiers_involved: vec![Tier::Tier0],
+                remediation: "Audit ACL permissions on this account. Check for WriteDacl, WriteOwner, \
+                             GenericAll rights on Tier 0 objects. Remove delegated permissions or \
+                             add to appropriate Tier 0 admin group.".to_string(),
+            });
+        }
+    }
+
+    // =========================================================================
+    // CHECK 2: Accounts that can write to AdminSDHolder
+    // Anyone who can write to AdminSDHolder effectively controls all protected accounts
+    // =========================================================================
+    // Note: This requires reading the ACL of AdminSDHolder which needs special handling
+    // For now, we flag any non-standard accounts with adminCount=1 as potential risks
+
+    // =========================================================================
+    // CHECK 3: Accounts with msDS-AllowedToActOnBehalfOfOtherIdentity on DCs
+    // This is a DCSync-equivalent attack path via RBCD
+    // Already handled in check_delegation_violations() for RBCD detection
+    // =========================================================================
+
+    // =========================================================================
+    // CHECK 4: Group Policy Creator Owners membership audit
+    // Members can create GPOs and potentially link them to impact Tier 0
+    // =========================================================================
+    let gpo_creators_filter = "(&(objectClass=group)(sAMAccountName=Group Policy Creator Owners))";
+
+    let gpo_group_results = ldap_search(
+        domain_dn,
+        gpo_creators_filter,
+        &["distinguishedName"],
+        SearchScope::Subtree,
+    ).unwrap_or_default();
+
+    if let Some(gpo_group) = gpo_group_results.first() {
+        if let Some(gpo_group_dn) = gpo_group.get("distinguishedname") {
+            // Find members of Group Policy Creator Owners
+            let member_filter = format!(
+                "(&(objectCategory=person)(objectClass=user)(memberOf:{}:={}))",
+                LDAP_MATCHING_RULE_IN_CHAIN,
+                escape_ldap_filter(gpo_group_dn)
+            );
+
+            let members = ldap_search(
+                domain_dn,
+                &member_filter,
+                &["name", "sAMAccountName", "distinguishedName"],
+                SearchScope::Subtree,
+            ).unwrap_or_default();
+
+            for member in members {
+                let name = member.get("name").cloned().unwrap_or_default();
+                let sam = member.get("samaccountname").cloned().unwrap_or_default();
+                let member_dn = member.get("distinguishedname").cloned().unwrap_or_default();
+
+                // Skip if member is in Tier 0
+                let member_tier = Tier::from_dn(&member_dn);
+                if member_tier != Some(Tier::Tier0) {
+                    violations.push(ComplianceViolation {
+                        violation_type: ViolationType::DangerousAclPermission,
+                        severity: ViolationSeverity::High,
+                        object_name: name,
+                        object_dn: member_dn,
+                        sam_account_name: sam,
+                        description: "Non-Tier0 account is member of Group Policy Creator Owners. \
+                                     Can create GPOs that may impact Tier 0 if linked inappropriately.".to_string(),
+                        tiers_involved: vec![member_tier.unwrap_or(Tier::Tier2), Tier::Tier0],
+                        remediation: "Remove from Group Policy Creator Owners or move account to Tier 0. \
+                                     GPO creation should be restricted to Tier 0 administrators.".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // CHECK 5: DnsAdmins group membership
+    // DnsAdmins can load arbitrary DLLs on DNS servers (typically DCs)
+    // MITRE ATT&CK: T1574.002
+    // =========================================================================
+    let dnsadmins_filter = "(&(objectClass=group)(sAMAccountName=DnsAdmins))";
+
+    let dns_group_results = ldap_search(
+        domain_dn,
+        dnsadmins_filter,
+        &["distinguishedName"],
+        SearchScope::Subtree,
+    ).unwrap_or_default();
+
+    if let Some(dns_group) = dns_group_results.first() {
+        if let Some(dns_group_dn) = dns_group.get("distinguishedname") {
+            // Find members of DnsAdmins
+            let member_filter = format!(
+                "(&(objectCategory=person)(objectClass=user)(memberOf:{}:={}))",
+                LDAP_MATCHING_RULE_IN_CHAIN,
+                escape_ldap_filter(dns_group_dn)
+            );
+
+            let members = ldap_search(
+                domain_dn,
+                &member_filter,
+                &["name", "sAMAccountName", "distinguishedName"],
+                SearchScope::Subtree,
+            ).unwrap_or_default();
+
+            for member in members {
+                let name = member.get("name").cloned().unwrap_or_default();
+                let sam = member.get("samaccountname").cloned().unwrap_or_default();
+                let member_dn = member.get("distinguishedname").cloned().unwrap_or_default();
+
+                // Flag if member is not in Tier 0
+                let member_tier = Tier::from_dn(&member_dn);
+                if member_tier != Some(Tier::Tier0) {
+                    // Also check if they're in a built-in admin group
+                    let builtin_memberships = get_builtin_group_memberships(&member_dn, domain_dn)
+                        .unwrap_or_default();
+
+                    if builtin_memberships.is_empty() {
+                        violations.push(ComplianceViolation {
+                            violation_type: ViolationType::DangerousAclPermission,
+                            severity: ViolationSeverity::Critical,
+                            object_name: name,
+                            object_dn: member_dn,
+                            sam_account_name: sam,
+                            description: "Non-Tier0 account is member of DnsAdmins. Can load arbitrary DLLs \
+                                         on DNS servers (typically Domain Controllers) for code execution.".to_string(),
+                            tiers_involved: vec![member_tier.unwrap_or(Tier::Tier2), Tier::Tier0],
+                            remediation: "Remove from DnsAdmins or move account to Tier 0. \
+                                         DnsAdmins is a Tier 0 equivalent group due to DC code execution.".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        violations = violations.len(),
+        "ACL-based attack path check completed"
+    );
+
+    Ok(violations)
+}
+
+// ============================================================================
+// PAW SECURITY VERIFICATION
+// MITRE ATT&CK: T1003.001
+// ============================================================================
+
+/// Check PAW (Privileged Access Workstation) security status
+///
+/// PAWs should have:
+/// - Credential Guard enabled (protects LSASS memory)
+/// - Secure Boot enabled
+/// - TPM present
+///
+/// Note: Full verification requires WMI queries to the actual machines.
+/// This function flags PAWs that cannot be verified as potentially insecure.
+///
+/// # Arguments
+/// * `domain_dn` - Domain distinguished name
+///
+/// # Returns
+/// * Vector of compliance violations for unverified PAWs
+pub fn check_paw_security(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
+    use crate::infrastructure::ad_search::discover_tier0_infrastructure;
+
+    let mut violations = Vec::new();
+
+    // Get Tier 0 infrastructure to find PAWs
+    let tier0_components = discover_tier0_infrastructure(domain_dn)
+        .map_err(|e| format!("Failed to discover Tier 0 infrastructure: {:?}", e))?;
+
+    for component in tier0_components {
+        // Check if this is a PAW
+        if matches!(component.role_type, crate::domain::Tier0RoleType::PAW) {
+            // Since we can't query Credential Guard status via LDAP alone,
+            // flag all PAWs as requiring verification
+            violations.push(ComplianceViolation {
+                violation_type: ViolationType::UnverifiedPawSecurity,
+                severity: ViolationSeverity::High,
+                object_name: component.name.clone(),
+                object_dn: component.distinguished_name.clone(),
+                sam_account_name: component.name.clone(),
+                description: format!(
+                    "PAW '{}' security features not verified. Credential Guard status unknown. \
+                     OS: {}",
+                    component.name,
+                    component.operating_system.as_deref().unwrap_or("Unknown")
+                ),
+                tiers_involved: vec![Tier::Tier0],
+                remediation: "Verify Credential Guard is enabled on this PAW:\n\
+                             1. Run 'msinfo32' and check 'Credential Guard, Hypervisor enforced'\n\
+                             2. Or run: Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\\Microsoft\\Windows\\DeviceGuard\n\
+                             3. Ensure RequiredSecurityProperties includes Credential Guard".to_string(),
+            });
+        }
+    }
+
+    tracing::info!(
+        paw_count = violations.len(),
+        "PAW security verification check completed"
+    );
+
+    Ok(violations)
+}
+
+// ============================================================================
+// PROTECTED USERS GROUP COMPLIANCE
+// MITRE ATT&CK: T1558.003
+// ============================================================================
+
+/// Check if Tier 0 administrators are members of the Protected Users group.
+///
+/// Protected Users group provides:
+/// - No NTLM authentication
+/// - No DES or RC4 Kerberos encryption
+/// - No credential delegation
+/// - No credential caching
+/// - 4-hour TGT lifetime
+///
+/// # Arguments
+/// * `domain_dn` - Domain distinguished name
+///
+/// # Returns
+/// * Vector of compliance violations for Tier 0 admins not in Protected Users
+pub fn check_protected_users_compliance(domain_dn: &str) -> Result<Vec<ComplianceViolation>, String> {
+    let mut violations = Vec::new();
+
+    // Find the Protected Users group DN
+    let protected_users_filter = "(&(objectClass=group)(sAMAccountName=Protected Users))";
+
+    let group_results = ldap_search(
+        domain_dn,
+        protected_users_filter,
+        &["distinguishedName"],
+        SearchScope::Subtree,
+    ).map_err(|e| format!("Failed to find Protected Users group: {:?}", e))?;
+
+    let protected_users_dn = match group_results.first() {
+        Some(result) => result.get("distinguishedname").cloned().unwrap_or_default(),
+        None => {
+            tracing::warn!("Protected Users group not found in domain");
+            return Ok(violations);
+        }
+    };
+
+    // Get all Tier 0 admin group members
+    let tier0_groups_ou = format!("OU=Groups,OU=Tier0,{}", domain_dn);
+
+    // Find Tier0-Admins and Tier0-Operators groups
+    for group_suffix in &["Admins", "Operators"] {
+        let group_name = format!("Tier0-{}", group_suffix);
+        let group_filter = format!(
+            "(&(objectClass=group)(sAMAccountName={}))",
+            escape_ldap_filter(&group_name)
+        );
+
+        let tier0_group_results = ldap_search(
+            &tier0_groups_ou,
+            &group_filter,
+            &["distinguishedName"],
+            SearchScope::OneLevel,
+        ).unwrap_or_default();
+
+        if let Some(tier0_group) = tier0_group_results.first() {
+            if let Some(tier0_group_dn) = tier0_group.get("distinguishedname") {
+                // Find all members of this Tier 0 group
+                let member_filter = format!(
+                    "(&(objectCategory=person)(objectClass=user)(memberOf:{}:={}))",
+                    LDAP_MATCHING_RULE_IN_CHAIN,
+                    escape_ldap_filter(tier0_group_dn)
+                );
+
+                let members = ldap_search(
+                    domain_dn,
+                    &member_filter,
+                    &["name", "sAMAccountName", "distinguishedName"],
+                    SearchScope::Subtree,
+                ).unwrap_or_default();
+
+                // Check each member for Protected Users membership
+                for member in members {
+                    let name = member.get("name").cloned().unwrap_or_default();
+                    let sam = member.get("samaccountname").cloned().unwrap_or_default();
+                    let member_dn = member.get("distinguishedname").cloned().unwrap_or_default();
+
+                    // Check if member is in Protected Users
+                    let in_protected_filter = format!(
+                        "(&(distinguishedName={})(memberOf:{}:={}))",
+                        escape_ldap_filter(&member_dn),
+                        LDAP_MATCHING_RULE_IN_CHAIN,
+                        escape_ldap_filter(&protected_users_dn)
+                    );
+
+                    let in_protected = ldap_search(
+                        domain_dn,
+                        &in_protected_filter,
+                        &["distinguishedName"],
+                        SearchScope::Subtree,
+                    ).map(|r| !r.is_empty()).unwrap_or(false);
+
+                    if !in_protected {
+                        violations.push(ComplianceViolation {
+                            violation_type: ViolationType::MissingProtectedUsers,
+                            severity: ViolationSeverity::Critical,
+                            object_name: name,
+                            object_dn: member_dn,
+                            sam_account_name: sam,
+                            description: format!(
+                                "Tier 0 administrator ({}) not in Protected Users group. \
+                                 Credentials vulnerable to NTLM relay, credential caching, and delegation attacks.",
+                                group_name
+                            ),
+                            tiers_involved: vec![Tier::Tier0],
+                            remediation: "Add account to Protected Users group. Verify application compatibility first - \
+                                         Protected Users cannot use NTLM, DES, or credential delegation.".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        violations = violations.len(),
+        "Protected Users compliance check completed"
+    );
+
+    Ok(violations)
+}
+
 /// Check if moving an object to a privileged tier is allowed.
 /// Implements TLA+ guard from MoveObjectToTier action (lines 425-436).
 ///
@@ -290,6 +1132,9 @@ pub fn check_object_tier_consistency(
 /// Uses LDAP_MATCHING_RULE_IN_CHAIN (1.2.840.113556.1.4.1941) for transitive
 /// group membership checking, which catches users who are members through
 /// nested groups.
+///
+/// Also checks for built-in privileged group memberships (Domain Admins,
+/// Enterprise Admins, etc.) which implicitly grant Tier 0 access.
 
 pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, String> {
     use std::collections::{HashMap, HashSet};
@@ -302,7 +1147,7 @@ pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, 
     let mut user_groups_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut user_dn_map: HashMap<String, String> = HashMap::new();
 
-    // Check each tier's groups
+    // Check each tier's custom groups
     for tier in &[Tier::Tier0, Tier::Tier1, Tier::Tier2] {
         let groups_ou = format!("OU=Groups,{},{}", tier.ou_path(), domain_dn);
 
@@ -357,6 +1202,65 @@ pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, 
         }
     }
 
+    // ============================================================================
+    // CHECK BUILT-IN PRIVILEGED GROUPS
+    // Members of Domain Admins, Enterprise Admins, etc. are implicitly Tier 0
+    // principals. If they also have access to Tier 1 or Tier 2 groups, that's
+    // a cross-tier violation.
+    // ============================================================================
+    for builtin_group in BUILTIN_PRIVILEGED_GROUPS {
+        // Find the built-in group DN
+        let group_filter = format!(
+            "(&(objectClass=group)(sAMAccountName={}))",
+            escape_ldap_filter(builtin_group)
+        );
+
+        let group_results = ldap_search(
+            domain_dn,
+            &group_filter,
+            &["distinguishedName"],
+            SearchScope::Subtree,
+        ).unwrap_or_default();
+
+        if let Some(group_result) = group_results.first() {
+            if let Some(group_dn) = group_result.get("distinguishedname") {
+                // Find all members of this built-in group (transitively)
+                let member_filter = format!(
+                    "(&(objectCategory=person)(objectClass=user)(memberOf:{}:={}))",
+                    LDAP_MATCHING_RULE_IN_CHAIN,
+                    escape_ldap_filter(group_dn)
+                );
+
+                if let Ok(member_results) = ldap_search(
+                    domain_dn,
+                    &member_filter,
+                    &["sAMAccountName", "distinguishedName"],
+                    SearchScope::Subtree,
+                ) {
+                    for user in member_results {
+                        let sam = user.get("samaccountname").cloned().unwrap_or_default();
+                        let dn = user.get("distinguishedname").cloned().unwrap_or_default();
+
+                        if !sam.is_empty() {
+                            // Built-in privileged group = implicit Tier 0 access
+                            user_tier_map
+                                .entry(sam.clone())
+                                .or_default()
+                                .insert(Tier::Tier0);
+                            user_groups_map
+                                .entry(sam.clone())
+                                .or_default()
+                                .push(format!("{} (built-in)", builtin_group));
+                            user_dn_map
+                                .entry(sam)
+                                .or_insert(dn);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Find users with access to multiple tiers
     for (account_name, tiers) in user_tier_map {
         if tiers.len() > 1 {
@@ -383,7 +1287,7 @@ pub fn check_cross_tier_access(domain_dn: &str) -> Result<Vec<CrossTierAccess>, 
 
     tracing::info!(
         violation_count = violations.len(),
-        "Cross-tier access check completed"
+        "Cross-tier access check completed (including built-in groups)"
     );
 
     Ok(violations)
@@ -780,6 +1684,36 @@ pub fn get_compliance_status(domain_dn: &str, stale_threshold_days: u32) -> Resu
     // Check for unassigned objects (not in any tier)
     let unassigned_violations = check_unassigned_objects(domain_dn)?;
     for violation in unassigned_violations {
+        status.add_violation(violation);
+    }
+
+    // Check AdminSDHolder violations (protected accounts in wrong tiers)
+    let adminsdholder_violations = check_admin_sdholder_violations(domain_dn)?;
+    for violation in adminsdholder_violations {
+        status.add_violation(violation);
+    }
+
+    // Check Kerberos delegation vulnerabilities (CRITICAL - can bypass tier model)
+    let delegation_violations = check_delegation_violations(domain_dn)?;
+    for violation in delegation_violations {
+        status.add_violation(violation);
+    }
+
+    // Check Protected Users group compliance for Tier 0 admins
+    let protected_users_violations = check_protected_users_compliance(domain_dn)?;
+    for violation in protected_users_violations {
+        status.add_violation(violation);
+    }
+
+    // Check ACL-based attack paths (Shadow Admins, dangerous group memberships)
+    let acl_violations = check_dangerous_acl_permissions(domain_dn)?;
+    for violation in acl_violations {
+        status.add_violation(violation);
+    }
+
+    // Check PAW security (Credential Guard verification)
+    let paw_violations = check_paw_security(domain_dn)?;
+    for violation in paw_violations {
         status.add_violation(violation);
     }
 

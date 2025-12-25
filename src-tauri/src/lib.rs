@@ -71,5 +71,8 @@ pub fn run() {
             diagnose_ad_connection,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "Failed to start Tauri application");
+            std::process::exit(1);
+        });
 }

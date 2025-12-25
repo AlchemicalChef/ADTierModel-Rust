@@ -23,6 +23,34 @@ pub enum ViolationType {
     ServiceAccountInteractiveLogon,
     /// Object not assigned to any tier
     UnassignedObject,
+    // ============================================================================
+    // KERBEROS DELEGATION ATTACK PATHS
+    // ============================================================================
+    /// Computer/user with unconstrained delegation (TRUSTED_FOR_DELEGATION)
+    /// MITRE ATT&CK: T1558.001, T1558.004
+    UnconstrainedDelegation,
+    /// Computer/user with constrained delegation (msDS-AllowedToDelegateTo)
+    /// MITRE ATT&CK: T1558.003
+    ConstrainedDelegation,
+    /// Computer with Resource-Based Constrained Delegation configured
+    /// MITRE ATT&CK: T1134.002
+    ResourceBasedConstrainedDelegation,
+    // ============================================================================
+    // CREDENTIAL PROTECTION
+    // ============================================================================
+    /// Tier 0 admin not in Protected Users group
+    /// MITRE ATT&CK: T1558.003
+    MissingProtectedUsers,
+    /// PAW without verified Credential Guard
+    /// MITRE ATT&CK: T1003.001
+    UnverifiedPawSecurity,
+    // ============================================================================
+    // ACL-BASED ATTACK PATHS (SHADOW ADMINS)
+    // ============================================================================
+    /// Non-Tier0 principal with dangerous ACL permissions on Tier 0 objects
+    /// Includes: GenericAll, WriteDacl, WriteOwner, ForceChangePassword
+    /// MITRE ATT&CK: T1222.001, T1078.002
+    DangerousAclPermission,
 }
 
 impl ViolationType {
@@ -35,6 +63,15 @@ impl ViolationType {
             ViolationType::StaleAccount => ViolationSeverity::Medium,
             ViolationType::ServiceAccountInteractiveLogon => ViolationSeverity::High,
             ViolationType::UnassignedObject => ViolationSeverity::High,
+            // Kerberos delegation - all critical as they bypass tier model
+            ViolationType::UnconstrainedDelegation => ViolationSeverity::Critical,
+            ViolationType::ConstrainedDelegation => ViolationSeverity::High,
+            ViolationType::ResourceBasedConstrainedDelegation => ViolationSeverity::Critical,
+            // Credential protection
+            ViolationType::MissingProtectedUsers => ViolationSeverity::Critical,
+            ViolationType::UnverifiedPawSecurity => ViolationSeverity::High,
+            // ACL-based attacks (shadow admins)
+            ViolationType::DangerousAclPermission => ViolationSeverity::Critical,
         }
     }
 
@@ -47,6 +84,15 @@ impl ViolationType {
             ViolationType::StaleAccount => "Account has not logged in for extended period",
             ViolationType::ServiceAccountInteractiveLogon => "Service account capable of interactive logon",
             ViolationType::UnassignedObject => "Object not assigned to any tier in the AD tiering model",
+            // Kerberos delegation
+            ViolationType::UnconstrainedDelegation => "Unconstrained delegation allows TGT capture from any authenticating user - complete tier bypass",
+            ViolationType::ConstrainedDelegation => "Constrained delegation can be abused for S4U2Self/S4U2Proxy privilege escalation",
+            ViolationType::ResourceBasedConstrainedDelegation => "RBCD allows privilege escalation from any principal with write access",
+            // Credential protection
+            ViolationType::MissingProtectedUsers => "Tier 0 admin not in Protected Users group - vulnerable to credential theft",
+            ViolationType::UnverifiedPawSecurity => "PAW without verified Credential Guard - Tier 0 credentials exposed to memory scraping",
+            // ACL-based attacks
+            ViolationType::DangerousAclPermission => "Non-Tier0 principal with dangerous permissions (GenericAll/WriteDacl/WriteOwner) on Tier 0 objects",
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ad-tier-model"
-version = "1.0.0"
+version = "1.2.0"
 description = "Active Directory Tier Model Management"
 authors = ["AD Tier Model"]
 edition = "2021"

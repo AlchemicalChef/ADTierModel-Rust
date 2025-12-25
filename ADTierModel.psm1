@@ -29,22 +29,66 @@ $script:TierConfiguration = @{
 $script:Tier0CriticalRoles = @{
     DomainController = @{
         Name = 'Domain Controller'
-        Detection = { (Get-ADComputer -Filter * -Properties OperatingSystem | Where-Object { $_.DistinguishedName -like '*Domain Controllers*' }).Name }
+        # Optimized: Query Domain Controllers OU directly instead of filtering all computers
+        Detection = {
+            try {
+                $domainDN = (Get-ADDomain -ErrorAction Stop).DistinguishedName
+                (Get-ADComputer -SearchBase "OU=Domain Controllers,$domainDN" -Filter * -Properties Name -ErrorAction SilentlyContinue).Name
+            } catch {
+                Write-Verbose "Domain Controller detection failed: $_"
+                @()
+            }
+        }
         Description = 'Active Directory Domain Controllers'
     }
     ADFS = @{
         Name = 'AD FS Server'
-        Detection = { (Get-ADComputer -Filter * -Properties ServicePrincipalName | Where-Object { $_.ServicePrincipalName -like '*http/sts*' -or $_.ServicePrincipalName -like '*http/adfs*' }).Name }
+        # Optimized: Use server-side SPN filter instead of retrieving all computers
+        Detection = {
+            try {
+                $adfsComputers = @()
+                $adfsComputers += @(Get-ADComputer -Filter "ServicePrincipalName -like '*http/sts*'" -Properties Name -ErrorAction SilentlyContinue)
+                $adfsComputers += @(Get-ADComputer -Filter "ServicePrincipalName -like '*http/adfs*'" -Properties Name -ErrorAction SilentlyContinue)
+                ($adfsComputers | Select-Object -Unique -ExpandProperty Name)
+            } catch {
+                Write-Verbose "ADFS detection failed: $_"
+                @()
+            }
+        }
         Description = 'Active Directory Federation Services servers'
     }
     EntraConnect = @{
         Name = 'Entra Connect (AAD Connect)'
-        Detection = { (Get-ADComputer -Filter * -Properties Description | Where-Object { $_.Description -like '*Azure AD Connect*' -or $_.Description -like '*AAD Connect*' -or $_.Description -like '*Entra Connect*' }).Name }
+        # Optimized: Use server-side Description filter
+        Detection = {
+            try {
+                $entraComputers = @()
+                $entraComputers += @(Get-ADComputer -Filter "Description -like '*Azure AD Connect*'" -Properties Name -ErrorAction SilentlyContinue)
+                $entraComputers += @(Get-ADComputer -Filter "Description -like '*AAD Connect*'" -Properties Name -ErrorAction SilentlyContinue)
+                $entraComputers += @(Get-ADComputer -Filter "Description -like '*Entra Connect*'" -Properties Name -ErrorAction SilentlyContinue)
+                ($entraComputers | Select-Object -Unique -ExpandProperty Name)
+            } catch {
+                Write-Verbose "Entra Connect detection failed: $_"
+                @()
+            }
+        }
         Description = 'Microsoft Entra Connect (Azure AD Connect) synchronization servers'
     }
     CertificateAuthority = @{
         Name = 'Certificate Authority'
-        Detection = { (Get-ADComputer -Filter * -Properties Description | Where-Object { $_.Description -like '*Certificate Authority*' -or $_.Description -like '*CA Server*' }).Name }
+        # Optimized: Use server-side Description filter and also check for certsvc SPN
+        Detection = {
+            try {
+                $caComputers = @()
+                $caComputers += @(Get-ADComputer -Filter "Description -like '*Certificate Authority*'" -Properties Name -ErrorAction SilentlyContinue)
+                $caComputers += @(Get-ADComputer -Filter "Description -like '*CA Server*'" -Properties Name -ErrorAction SilentlyContinue)
+                $caComputers += @(Get-ADComputer -Filter "ServicePrincipalName -like 'certsvc/*'" -Properties Name -ErrorAction SilentlyContinue)
+                ($caComputers | Select-Object -Unique -ExpandProperty Name)
+            } catch {
+                Write-Verbose "Certificate Authority detection failed: $_"
+                @()
+            }
+        }
         Description = 'Enterprise Certificate Authority servers'
     }
     PAW = @{
@@ -60,6 +104,7 @@ $script:Tier0CriticalRoles = @{
                 $pawComputers | Select-Object -Unique -ExpandProperty Name
             }
             catch {
+                Write-Verbose "PAW detection failed: $_"
                 @()
             }
         }
@@ -73,7 +118,47 @@ $script:ConfigPath = "$env:ProgramData\ADTierModel\config.json"
 
 #region Core Helper Functions (Must be defined first)
 
-function Ensure-TierDataDirectory {
+function Protect-LDAPFilterValue {
+    <#
+    .SYNOPSIS
+        Escapes special characters in LDAP filter values to prevent injection attacks.
+    .DESCRIPTION
+        LDAP filter injection can occur when user input is interpolated directly into
+        LDAP filter strings. This function escapes special characters per RFC 4515.
+    .PARAMETER Value
+        The string value to escape for use in an LDAP filter.
+    .OUTPUTS
+        Returns the escaped string safe for LDAP filter use.
+    .EXAMPLE
+        $safeName = Protect-LDAPFilterValue -Value $GroupName
+        Get-ADGroup -Filter "Name -eq '$safeName'"
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    process {
+        if ([string]::IsNullOrEmpty($Value)) {
+            return $Value
+        }
+
+        # Escape special LDAP filter characters per RFC 4515
+        # Order matters: escape backslash first
+        $escaped = $Value -replace '\\', '\5c'
+        $escaped = $escaped -replace '\*', '\2a'
+        $escaped = $escaped -replace '\(', '\28'
+        $escaped = $escaped -replace '\)', '\29'
+        $escaped = $escaped -replace '\x00', '\00'
+
+        return $escaped
+    }
+}
+
+function Assert-TierDataDirectory {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -148,7 +233,8 @@ function Test-ADGroupExists {
     )
 
     try {
-        $group = Get-ADGroup -Filter "Name -eq '$GroupName'" -ErrorAction Stop
+        $safeGroupName = Protect-LDAPFilterValue -Value $GroupName
+        $group = Get-ADGroup -Filter "Name -eq '$safeGroupName'" -ErrorAction Stop
         return ($null -ne $group)
     }
     catch {
@@ -204,7 +290,7 @@ function Write-TierLog {
     )
 
     $logPath = "$env:ProgramData\ADTierModel\Logs"
-    Ensure-TierDataDirectory -Path $logPath
+    Assert-TierDataDirectory -Path $logPath
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $logFile = Join-Path $logPath "ADTierModel_$(Get-Date -Format 'yyyyMMdd').log"
@@ -426,7 +512,8 @@ function Initialize-ADTierModel {
                     
                     if ($PSCmdlet.ShouldProcess($groupName, "Create Security Group")) {
                         try {
-                            $existingGroup = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction SilentlyContinue
+                            $safeGroupName = Protect-LDAPFilterValue -Value $groupName
+                            $existingGroup = Get-ADGroup -Filter "Name -eq '$safeGroupName'" -ErrorAction SilentlyContinue
                             
                             if (-not $existingGroup) {
                                 $groupParams = @{
@@ -1280,7 +1367,8 @@ function Get-ADTierViolation {
         Write-Verbose "Checking for cross-tier access..."
         
         foreach ($tierKey in $script:TierConfiguration.Keys) {
-            $adminGroup = Get-ADGroup -Filter "Name -eq '$tierKey-Admins'" -ErrorAction SilentlyContinue
+            $safeAdminGroupName = Protect-LDAPFilterValue -Value "$tierKey-Admins"
+            $adminGroup = Get-ADGroup -Filter "Name -eq '$safeAdminGroupName'" -ErrorAction SilentlyContinue
 
             if ($adminGroup) {
                 try {
@@ -2093,13 +2181,15 @@ function Add-ADTierGroupMember {
     }
 
     try {
-        $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
+        $safeGroupName = Protect-LDAPFilterValue -Value $groupName
+        $group = Get-ADGroup -Filter "Name -eq '$safeGroupName'" -ErrorAction Stop
 
         foreach ($member in $Members) {
             if ($PSCmdlet.ShouldProcess($member, "Add to $groupName")) {
                 try {
                     # Check if member exists
-                    $adObject = Get-ADObject -Filter "SamAccountName -eq '$member'" -ErrorAction Stop
+                    $safeMember = Protect-LDAPFilterValue -Value $member
+                    $adObject = Get-ADObject -Filter "SamAccountName -eq '$safeMember'" -ErrorAction Stop
                     
                     # Check if already a member
                     $isMember = Get-ADGroupMember -Identity $group | Where-Object { $_.SamAccountName -eq $member }
@@ -3133,7 +3223,8 @@ function New-ADTierAdminAccount {
             }
             
             # Check if account already exists
-            $existingUser = Get-ADUser -Filter "SamAccountName -eq '$Username'" -ErrorAction SilentlyContinue
+            $safeUsername = Protect-LDAPFilterValue -Value $Username
+            $existingUser = Get-ADUser -Filter "SamAccountName -eq '$safeUsername'" -ErrorAction SilentlyContinue
             if ($existingUser) {
                 throw "User account already exists: $Username"
             }
@@ -3198,7 +3289,25 @@ function New-ADTierAdminAccount {
                     Write-TierLog -Message "Configured account not delegated for Tier 0 account: $Username" -Level Info -Component 'AccountManagement'
                 }
                 
-                # Output account details
+                # Securely store password to a protected file instead of displaying it
+                $passwordFilePath = "$env:ProgramData\ADTierModel\Credentials"
+                Assert-TierDataDirectory -Path $passwordFilePath
+                $passwordFile = Join-Path $passwordFilePath "$Username`_initial_password.txt"
+
+                # Write password to file with restrictive ACLs (only Administrators can read)
+                $password | Out-File -FilePath $passwordFile -Encoding UTF8 -Force
+                $acl = Get-Acl $passwordFile
+                $acl.SetAccessRuleProtection($true, $false)
+                $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Administrators', 'FullControl', 'Allow')
+                $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM', 'FullControl', 'Allow')
+                $acl.SetAccessRule($adminRule)
+                $acl.SetAccessRule($systemRule)
+                Set-Acl -Path $passwordFile -AclObject $acl
+
+                # Clear password from memory as soon as possible
+                $securePassword.Dispose()
+
+                # Output account details - SECURITY: Password not included in output object
                 $accountInfo = [PSCustomObject]@{
                     Username = $Username
                     TierName = $TierName
@@ -3206,19 +3315,20 @@ function New-ADTierAdminAccount {
                     Email = $Email
                     OUPath = $usersOU
                     AdminGroup = $adminGroup
-                    InitialPassword = $password
+                    PasswordStoredAt = $passwordFile
                     MustChangePassword = $true
                     LockoutProtection = $NoLockout
                     Created = Get-Date
                 }
-                
+
                 Write-Host "`n=== Admin Account Created Successfully ===" -ForegroundColor Green
                 Write-Host "Username: $Username" -ForegroundColor Cyan
                 Write-Host "Tier: $TierName" -ForegroundColor Cyan
-                Write-Host "Initial Password: $password" -ForegroundColor Yellow
-                Write-Host "IMPORTANT: Save this password securely. User must change at first logon." -ForegroundColor Red
+                Write-Host "Initial Password: Stored securely at $passwordFile" -ForegroundColor Yellow
+                Write-Host "IMPORTANT: Retrieve password from secure location. User must change at first logon." -ForegroundColor Red
+                Write-Host "NOTE: Delete the password file after retrieving it." -ForegroundColor Red
                 Write-Host "Admin Group: $adminGroup" -ForegroundColor Cyan
-                
+
                 return $accountInfo
             }
         }
